@@ -3,6 +3,7 @@
  * getUserMedia audio. Segmented f32 PCM is POSTed to the host, which runs
  * SenseVoice (sherpa-onnx) and returns the transcript.
  */
+import { NlmsAec } from './aec.ts'
 
 export type AsrState = 'idle' | 'recording' | 'speech' | 'transcribing' | 'loading-model'
 
@@ -65,7 +66,25 @@ const PARTIAL_MAX_S = 12
 // 1024 samples @ 16kHz = 64ms per onaudioprocess tick.
 const BUFFER_SIZE = 1024
 
-export function createAsrEngine(config: AsrConfig, basePath: string): AsrEngine {
+export interface EchoReference {
+  /** MediaElementAudioSourceNode wired from the page's TTS <audio>. */
+  readonly node: AudioNode
+}
+
+/**
+ * @param getEchoReference Optional accessor for the page's TTS playback as an
+ * audio node. When provided, the recorder runs an explicit NLMS echo canceller
+ * using TTS output as the reference, so loud assistant speech does not trip the
+ * barge-in VAD through the loudspeaker->mic path. Falls back to the browser's
+ * `echoCancellation` constraint when absent.
+ */
+export type EchoReferenceProvider = () => EchoReference | null | undefined
+
+export function createAsrEngine(
+  config: AsrConfig,
+  basePath: string,
+  getEchoReference?: EchoReferenceProvider,
+): AsrEngine {
   let state: AsrState = 'idle'
   const stateListeners = new Set<(s: AsrState) => void>()
   const transcriptListeners = new Set<(text: string) => void>()
@@ -105,6 +124,22 @@ export function createAsrEngine(config: AsrConfig, basePath: string): AsrEngine 
    */
   let partialEpoch = 0
   let partialAbort: AbortController | null = null
+  /**
+   * Incremental ASR: samples already handed to the host for this capture.
+   * Interim passes only re-send the delta, and the host keeps a sliding
+   * window per session, so preview cost stops growing with hold length.
+   */
+  let partialSentSamples = 0
+  /** One session per capture; correlates browser deltas host-side. */
+  let partialSessionId = ''
+
+  /** New session id for the capture about to start. */
+  const newPartialSession = (): string => {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID()
+    }
+    return `p-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  }
 
   const setState = (s: AsrState): void => {
     state = s
@@ -152,9 +187,16 @@ export function createAsrEngine(config: AsrConfig, basePath: string): AsrEngine 
     if (partialInFlight || partialListeners.size === 0 || segment.length === 0) return
     const seconds = segment.reduce((n, c) => n + c.length, 0) / SAMPLE_RATE
     if (seconds < PARTIAL_MIN_S || seconds > PARTIAL_MAX_S) return
-    // Snapshot now: the recorder keeps appending while the request is in
-    // flight, and a growing Float32Array cannot be sent as a body.
+
     const samples = concatSegment()
+    if (samples.length <= partialSentSamples) return
+
+    // Only the delta since the last interim pass goes over the wire; the host
+    // appends it to the session's sliding window. The cursor advances
+    // optimistically so a slow/aborted interim never makes the next pass
+    // re-send audio the host already has.
+    const delta = samples.subarray(partialSentSamples)
+    partialSentSamples = samples.length
     const epoch = partialEpoch
     partialInFlight = true
     const ctrl = new AbortController()
@@ -162,8 +204,13 @@ export function createAsrEngine(config: AsrConfig, basePath: string): AsrEngine 
     try {
       const res = await fetch(asrUrl, {
         method: 'POST',
-        headers: { 'content-type': 'application/octet-stream' },
-        body: samples.buffer as ArrayBuffer,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-dsh-session': partialSessionId,
+        },
+        // .slice() copies so the body is exactly the delta: subarray() is a
+        // view whose .buffer still spans the whole capture.
+        body: delta.slice().buffer as ArrayBuffer,
         signal: ctrl.signal,
       })
       if (!res.ok) return
@@ -318,22 +365,40 @@ export function createAsrEngine(config: AsrConfig, basePath: string): AsrEngine 
 
   const startRecorder = async (): Promise<void> => {
     if (active) return
+    // When no explicit echo reference is available, keep the browser's own
+    // AEC (getUserMedia constraint) as the safety net.
+    const echoRef = getEchoReference?.()?.node ?? null
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: true,
+        echoCancellation: echoRef === null,
         noiseSuppression: true,
         autoGainControl: true,
       },
     })
     audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE })
     const source = audioCtx.createMediaStreamSource(stream)
-    processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1)
-    processor.onaudioprocess = (e) => {
-      const input = e.inputBuffer.getChannelData(0)
-      handleAudio(new Float32Array(input))
+    if (echoRef === null) {
+      processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1)
+      processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0)
+        handleAudio(new Float32Array(input))
+      }
+      source.connect(processor)
+    } else {
+      // NLMS AEC: mic on channel 0, TTS reference on channel 1. The filter
+      // learns the speaker->mic path and subtracts assistant audio before it
+      // reaches the barge-in VAD.
+      const aec = new NlmsAec({})
+      processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 2, 1)
+      processor.onaudioprocess = (e) => {
+        const mic = e.inputBuffer.getChannelData(0)
+        const ref = e.inputBuffer.getChannelData(1)
+        handleAudio(aec.process(mic, ref))
+      }
+      source.connect(processor, 0, 0)
+      echoRef.connect(processor, 0, 1)
     }
-    source.connect(processor)
     processor.connect(audioCtx.destination)
     active = true
   }
@@ -386,6 +451,8 @@ export function createAsrEngine(config: AsrConfig, basePath: string): AsrEngine 
       // ignore
     }
     processor = null
+    partialSentSamples = 0
+    partialSessionId = ''
     try {
       void stream?.getTracks().forEach((t) => t.stop())
     } catch {
@@ -409,6 +476,8 @@ export function createAsrEngine(config: AsrConfig, basePath: string): AsrEngine 
       holdMode = options?.hold === true
       partialEpoch++
       sincePartialMs = 0
+      partialSentSamples = 0
+      partialSessionId = newPartialSession()
       setState('recording')
       try {
         await startRecorder()

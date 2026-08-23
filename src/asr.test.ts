@@ -269,3 +269,45 @@ describe('interim transcripts', () => {
     expect(partials).toEqual([])
   })
 })
+
+describe('incremental interim transcripts', () => {
+  let audio: { tick(a: number): void }
+  beforeEach(() => { audio = installFakeAudio() })
+  const TICKS_PER_INTERVAL = 15
+
+  it('sends only the delta since the previous pass, with a session header', async () => {
+    // Track headers + body byte lengths for each interim POST.
+    const calls: { bytes: number; session?: string }[] = []
+    vi.stubGlobal('fetch', async (_url: string, init: { body: ArrayBuffer; headers: Record<string, string> }) => {
+      calls.push({ bytes: init.body.byteLength, session: init.headers['x-dsh-session'] })
+      return { ok: true, status: 200, json: async () => ({ text: '你好' }) }
+    })
+    const engine = createAsrEngine(cfg, '/dsh-voice-api')
+    engine.onPartial(() => {})
+
+    await engine.start({ hold: true })
+    // First interim pass: ~0.96s of audio.
+    for (let i = 0; i < TICKS_PER_INTERVAL; i++) audio.tick(0.2)
+    // Let the whole fetch chain (await fetch + await json + delta bookkeeping)
+    // settle before the next interval, or the second pass re-sends everything.
+    await settle()
+    await settle()
+    expect(calls).toHaveLength(1)
+    const firstBytes = calls[0].bytes
+    expect(firstBytes).toBeGreaterThan(0)
+    // Incremental: each pass must carry the session correlation header.
+    expect(calls[0].session).toBeTruthy()
+
+    // Second pass: only the new ticks should go over the wire (delta < total).
+    for (let i = 0; i < TICKS_PER_INTERVAL; i++) audio.tick(0.2)
+    await settle()
+    await settle()
+    expect(calls).toHaveLength(2)
+    // The second delta must be strictly smaller than the whole capture and
+    // carry the same session id.
+    expect(calls[1].bytes).toBeLessThan(firstBytes * 2)
+    expect(calls[1].session).toBe(calls[0].session)
+
+    await engine.cancel()
+  })
+})

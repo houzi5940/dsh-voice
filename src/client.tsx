@@ -1,6 +1,12 @@
 import * as React from 'react'
 import { useEffect, useRef, useState } from 'react'
-import { createAsrEngine, type AsrConfig, type AsrEngine, type AsrState } from './asr.ts'
+import {
+  createAsrEngine,
+  type AsrConfig,
+  type AsrEngine,
+  type AsrState,
+  type EchoReference,
+} from './asr.ts'
 
 /**
  * dsh-voice client half: voice playback surface + microphone input.
@@ -100,11 +106,40 @@ function base64ToAudioUrl(b64: string): string {
   return URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }))
 }
 
+/** The page's single TTS <audio> element (created lazily). */
+const audioElement: HTMLAudioElement = new Audio()
+
+// Shared Web Audio graph for playback + mic. Keeping TTS and the recorder in
+// one AudioContext lets the ASR engine cancel assistant audio using the page's
+// own playback as the echo reference (see aec.ts).
+let sharedAudioCtx: AudioContext | null = null
+let echoRefNode: MediaElementAudioSourceNode | null = null
+
+/** Accessor the ASR engine calls to obtain the TTS echo reference. */
+function getEchoReference(): EchoReference | null {
+  return echoRefNode ? { node: echoRefNode } : null
+}
+
+/** Create the shared context lazily on first playback (user-gesture-safe). */
+function ensureAudioCtx(): AudioContext {
+  if (sharedAudioCtx === null) {
+    sharedAudioCtx = new AudioContext()
+    // The echo reference must route to the speakers too: wiring the element
+    // into the graph detaches it from the default output.
+    const el = audioElement
+    if (el !== null && echoRefNode === null) {
+      echoRefNode = sharedAudioCtx.createMediaElementSource(el)
+      echoRefNode.connect(sharedAudioCtx.destination)
+    }
+  }
+  return sharedAudioCtx
+}
+
 function createAudioEngine(): VoicePanelActions {
   const listeners = new Set<(s: AudioState) => void>()
   let state: AudioState = { connected: false, playing: false, caption: null }
   const queue: VoiceFrame[] = []
-  const audio = new Audio()
+  const audio = audioElement
   let source: EventSource | null = null
 
   const notify = (): void => {
@@ -122,6 +157,9 @@ function createAudioEngine(): VoicePanelActions {
       setState({ playing: false, caption: null })
       return
     }
+    // Ensure the shared graph exists before the element plays, so the echo
+    // reference is wired before any audio reaches the speakers.
+    ensureAudioCtx()
     const url = base64ToAudioUrl(frame.audio)
     audio.src = url
     audio.onended = () => {
@@ -690,7 +728,10 @@ export function MicButton({ useSession, useInput, inputActions, skipPlayback, ca
         const hk = c.asr.hotkey ?? ''
         hotkeyRef.current = hk
         setHotkey(hk)
-        const engine = createAsrEngine(c.asr, c.basePath)
+        // Pass the TTS playback as the echo reference: the ASR engine cancels
+        // assistant audio before the barge-in VAD, so a loud TTS voice no
+        // longer trips the mic (browser AEC is inconsistent across OSes).
+        const engine = createAsrEngine(c.asr, c.basePath, getEchoReference)
         engine.onState(setAsrState)
         // Barge-in: the leading edge of user speech silences the assistant
         // (always), and stops the running turn when one exists (the stop

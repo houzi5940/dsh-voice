@@ -202,6 +202,40 @@ export function apply(ctx: Context, config: Config): void {
     return recognizer
   }
 
+  // Incremental ASR: a live-caption session accumulates a sliding window of
+  // audio (bounded below) instead of re-decoding the whole hold each time.
+  // SenseVoice is a non-streaming model, but decoding a fixed-size tail costs
+  // a bounded amount per interim pass, so preview latency stops growing with
+  // hold length.
+  const PARTIAL_WINDOW_S = 8
+  const PARTIAL_WINDOW_SAMPLES = PARTIAL_WINDOW_S * 16000
+  const asrSessions = new Map<string, Float32Array>()
+  // Retire sessions older than this; interims are best-effort previews.
+  const SESSION_TTL_MS = 60_000
+  const asrSessionTouch = new Map<string, number>()
+  const touchSession = (id: string): void => {
+    asrSessionTouch.set(id, Date.now())
+  }
+  setInterval(() => {
+    const now = Date.now()
+    for (const [id, last] of asrSessionTouch) {
+      if (now - last > SESSION_TTL_MS) {
+        asrSessions.delete(id)
+        asrSessionTouch.delete(id)
+      }
+    }
+  }, 30_000).unref()
+
+  const decodeSamples = (samples: Float32Array): string => {
+    const rec = getRecognizer()
+    const stream = rec.createStream()
+    stream.acceptWaveform(16000, samples)
+    rec.decode(stream)
+    const text = rec.getResult(stream).text
+    stream.free()
+    return text
+  }
+
   ctx.effect(() =>
     ctx.webServer.register({
       kind: 'exact',
@@ -217,14 +251,29 @@ export function apply(ctx: Context, config: Config): void {
             res.end(JSON.stringify({ error: 'invalid pcm payload' }))
             return
           }
-          const samples = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4)
+          const delta = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4)
+          const session = String(req.headers['x-dsh-session'] ?? '')
           try {
-            const rec = getRecognizer()
-            const stream = rec.createStream()
-            stream.acceptWaveform(16000, samples)
-            rec.decode(stream)
-            const text = rec.getResult(stream).text
-            stream.free()
+            let text: string
+            if (session !== '') {
+              // Incremental interim: append the delta to the session window.
+              const prev = asrSessions.get(session) ?? new Float32Array(0)
+              const merged = new Float32Array(prev.length + delta.length)
+              merged.set(prev, 0)
+              merged.set(delta, prev.length)
+              // Keep only the tail of the window: enough context for a
+              // coherent caption, fixed cost per pass.
+              if (merged.length > PARTIAL_WINDOW_SAMPLES) {
+                text = decodeSamples(merged.subarray(merged.length - PARTIAL_WINDOW_SAMPLES))
+              } else {
+                text = decodeSamples(merged)
+              }
+              asrSessions.set(session, merged)
+              touchSession(session)
+            } else {
+              // Final transcription: decode exactly what was sent.
+              text = decodeSamples(delta)
+            }
             res.statusCode = 200
             res.end(JSON.stringify({ text }))
           } catch (error) {
