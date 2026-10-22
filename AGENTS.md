@@ -62,6 +62,7 @@ docs/demo.py        # Pillow 手绘 demo.gif（无需真人录制）
 10. **热键必须让真快捷键活着**：键盘阈值 600ms（远大于指针的 260ms），且 hold 期间按下任何其他键就作废本次录音——否则慢速 `Ctrl+C` 会变成一段语音。`Escape` 任何时候取消，`window blur` 也取消（切窗口收不到 keyup，麦克风会一直开着）。
 11. **实时字幕是"预览"，不是结果**：`onPartial` 只在有监听者时才触发 host 重解码（SenseVoice 非流式，每次预览都是整段重跑），>12s 停止预览；松手会 bump `partialEpoch`，迟到的 interim 直接丢弃，**绝不能**混进 `onSegment`/草稿。
 12. **松手后浮层要留着**：`pending` 状态维持浮层 + spinner + 冻结波形，直到 `onSegment` 到达。空识别结果不会触发 `onSegment`，所以必须同时监听 `asrState` 回到 `idle` 的边（否则 spinner 永久转）。
+13. **`/config` 必须固定在 `/dsh-voice-api`**：客户端无法预先知道自定义 `basePath`，只能靠这个引导路径发现其余路由。host 会同时在 `basePath/config` 和 `/dsh-voice-api/config` 注册，client 的 `loadConfig()` 用后者；改路由时两边一起改。
 
 ## 已知坑（历史事故，勿重蹈）
 
@@ -73,6 +74,9 @@ docs/demo.py        # Pillow 手绘 demo.gif（无需真人录制）
 - **错误态要在标签上露出**：`MicButton` 的 label 判断中 `error` 必须优先于 `asrState === 'idle'`，否则 host config 拉取失败时用户只看到普通的 `mic`（曾是真 bug，被组件测试抓出）。
 - **window 级监听不能捕获渲染闭包**：`MicButton` 的指针/键盘监听只在挂载时装一次，所有回调必须走 `beginHoldRef`/`endHoldRef`/`findSendKeyRef` 转发，否则拿到的是首帧的陈旧闭包（曾导致"按了没反应"）。
 - **VAD 门控曾静默吞掉长按录音**：RMS < 0.015 的整段录音在 tap 模式下会被丢弃，长按时表现为"按了说话没用"。修法是 hold 模式全程收音；另外时长判断要在**补尾垫之前**测，否则 350ms 静音垫会让 64ms 的误触通过下限。
+- **`msedge-tts` 必须 ≥ 2.1.0**：2.0.7 会被 Edge 服务直接 403（2026-10 起），表现为"朗读完全没声音"且测试里刷 `TTS unavailable`。`package.json` 的 `^2.0.7` 本身允许 2.1.0，坑在 lockfile 锁了旧版本。
+- **分句的 Markdown 清洗必须跨 delta**：`plainText` 是单块清洗，跨 chunk 的 ```` ``` ```` 围栏永远匹配不上，代码会被原样朗读。`SentenceSegmenter` 里的 `MarkdownStreamFilter` 负责围栏/行内代码的状态，不要退回"逐块 plainText"。
+- **TTS 失败不能立即重新 pump**：`ensureReady()` 失败时在 `finally` 里直接重试会变成热循环（403/DNS 失败时几百次/秒）。现在是 1s→2s→4s…（上限 30s）退避，5 次后丢弃该批句子。
 - **npm publish**：账号开 2FA，`.npmrc` 需放 granular + bypass 2FA 的 token；`NODE_AUTH_TOKEN` 在 npm 11+ 已失效。发布后 registry CDN 有几分钟缓存延迟，`npm view` 404 不代表失败，去 npmjs.com 网页确认。
 
 ## 发布流程

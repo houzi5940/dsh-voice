@@ -1,10 +1,12 @@
 # dsh-voice
 
+English | [简体中文](./README.zh-CN.md)
+
 Full-duplex voice mode for DeepSeek Harness: streamed ASR → LLM → TTS with barge-in.
 
 ## Status
 
-**v0.7.0 — press-to-talk with a live caption.**
+**v0.8.0 — press-to-talk with a live caption.**
 
 Speak into the composer mic: the assistant silences itself (playback stops,
 host synthesis queue drops), the running turn is cancelled (the stop-button
@@ -101,7 +103,7 @@ barge-in: speech edge ──▶ engine.skip() + POST /cancel (epoch bump)
 | `GET /dsh-voice-api/stream` | SSE; `event: audio` frames `{sessionId, seq, text, audio(base64 MP3)}` |
 | `POST /dsh-voice-api/asr` | raw little-endian f32 PCM body → `{text}` via SenseVoice |
 | `POST /dsh-voice-api/cancel` | `{sessionId}` drops queued + in-flight synthesis (epoch bump) |
-| `GET /dsh-voice-api/config` | ASR runtime config `{asr: {...}}` for the mic button |
+| `GET /dsh-voice-api/config` | ASR runtime config `{asr, basePath}`. Always served at this fixed path, so a client can discover a custom `basePath` |
 | `GET /dsh-voice-api/hf/*` | cache-through HF model proxy (mirrors to `cacheDir`) |
 | `GET /dsh-voice-api/*` | ping: `{ok, name, enabled}` |
 
@@ -142,9 +144,10 @@ Note: needs Node ≥ 22.19 or ≥ 24 (`node:zlib` zstd APIs).
 ## Tests
 
 ```sh
-npm test                                # segmenter unit tests (pure, no network)
+npm test                                # host suites + client component tests
+npm run test:host                       # segmenter / TTS backoff / barge-in / integration
+npm run test:client                     # vitest + jsdom
 node test/host.integration.test.mjs     # llm/stream tap + real Edge TTS + SSE + /config
-node test/bargein.test.mjs              # client inject face wiring (skipPlayback/cancelTurn)
-node test/bargein-semantics.test.mjs    # aborted turn no-flush + cancel drops in-flight
+node test/tts-retry.test.mjs            # failed synthesis backs off instead of hot-looping
 node verify-client.mjs                  # client bundle registration/exports/slots/dynamic-import
 ```

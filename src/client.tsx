@@ -25,6 +25,7 @@ interface VoiceFrame {
 
 export interface VoicePanelActions {
   connect(): void
+  disconnect(): void
   skip(): void
   subscribe(fn: (s: AudioState) => void): () => void
 }
@@ -41,6 +42,55 @@ interface HostConfig {
     hotkey?: string
   }
   basePath: string
+}
+
+/**
+ * Fixed config bootstrap path.
+ *
+ * Every other route lives under the host's `basePath`, which the client
+ * cannot know in advance — so `/config` is always served here and the
+ * response tells us where `/stream`, `/asr` and `/cancel` actually are.
+ */
+const BOOTSTRAP_BASE = '/dsh-voice-api'
+let apiBase = BOOTSTRAP_BASE
+let configPromise: Promise<HostConfig> | null = null
+
+/** Absolute-in-origin URL for a host route under the discovered base. */
+function apiUrl(path: string): string {
+  return `${apiBase}${path}`
+}
+
+/** Load (and cache) the host config; the base path comes from it. */
+function loadConfig(): Promise<HostConfig> {
+  if (configPromise === null) {
+    configPromise = fetch(`${BOOTSTRAP_BASE}/config`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`config http ${r.status}`)
+        return r.json() as Promise<HostConfig>
+      })
+      .then((c) => {
+        const base = typeof c.basePath === 'string' ? c.basePath.replace(/\/+$/, '') : ''
+        if (base) apiBase = base
+        return c
+      })
+      .catch((error: unknown) => {
+        // Do not cache a failure: a later mount may retry.
+        configPromise = null
+        throw error
+      })
+  }
+  return configPromise
+}
+
+/**
+ * Test seam: forget the cached config so the next call refetches.
+ *
+ * Not part of the plugin surface — the component tests swap the host config
+ * between cases and need the per-page cache to start clean.
+ */
+export function __resetVoiceConfigCache(): void {
+  configPromise = null
+  apiBase = BOOTSTRAP_BASE
 }
 
 export const inject = ['slots', 'sessions']
@@ -74,7 +124,7 @@ export function apply(ctx: any): void {
           skipPlayback: () => {
             engine.skip()
             if (sessionId !== undefined) {
-              void fetch('/dsh-voice-api/cancel', {
+              void fetch(apiUrl('/cancel'), {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({ sessionId }),
@@ -141,6 +191,7 @@ function createAudioEngine(): VoicePanelActions {
   const queue: VoiceFrame[] = []
   const audio = audioElement
   let source: EventSource | null = null
+  let connecting = false
 
   const notify = (): void => {
     for (const fn of listeners) fn(state)
@@ -177,15 +228,36 @@ function createAudioEngine(): VoicePanelActions {
   }
 
   const connect = (): void => {
-    if (source) return
-    source = new EventSource('/dsh-voice-api/stream')
-    source.onopen = () => setState({ connected: true })
-    source.onerror = () => setState({ connected: false })
-    source.addEventListener('audio', (e: MessageEvent<string>) => {
-      const frame = JSON.parse(e.data) as VoiceFrame
-      queue.push(frame)
-      if (audio.paused) playNext()
-    })
+    if (source !== null || connecting) return
+    connecting = true
+    // Resolve the host's basePath before opening the stream: a custom base
+    // must not leave the page listening on the default path forever.
+    void loadConfig()
+      .then(() => {
+        if (source !== null) return
+        source = new EventSource(apiUrl('/stream'))
+        source.onopen = () => setState({ connected: true })
+        source.onerror = () => setState({ connected: false })
+        source.addEventListener('audio', (e: MessageEvent<string>) => {
+          const frame = JSON.parse(e.data) as VoiceFrame
+          queue.push(frame)
+          if (audio.paused) playNext()
+        })
+      })
+      .catch(() => {
+        // Config unreachable: retry on the next mount rather than retrying in
+        // a loop while the host is down.
+        setState({ connected: false })
+      })
+      .finally(() => {
+        connecting = false
+      })
+  }
+
+  const disconnect = (): void => {
+    source?.close()
+    source = null
+    setState({ connected: false, playing: false, caption: null })
   }
 
   const skip = (): void => {
@@ -204,11 +276,11 @@ function createAudioEngine(): VoicePanelActions {
     }
   }
 
-  return { connect, skip, subscribe }
+  return { connect, disconnect, skip, subscribe }
 }
 
 export function VoicePanel(props: VoicePanelActions): React.ReactElement {
-  const { connect, skip, subscribe } = props
+  const { connect, disconnect, skip, subscribe } = props
   const [state, setState] = useState<AudioState>({
     connected: false,
     playing: false,
@@ -217,8 +289,12 @@ export function VoicePanel(props: VoicePanelActions): React.ReactElement {
 
   useEffect(() => {
     connect()
-    return subscribe(setState)
-  }, [connect, subscribe])
+    const unsubscribe = subscribe(setState)
+    return () => {
+      unsubscribe()
+      disconnect()
+    }
+  }, [connect, disconnect, subscribe])
 
   useStyle(UI_CSS)
 
@@ -720,8 +796,7 @@ export function MicButton({ useSession, useInput, inputActions, skipPlayback, ca
   // load ASR config from the host once
   useEffect(() => {
     let cancelled = false
-    fetch('/dsh-voice-api/config')
-      .then((r) => r.json() as Promise<HostConfig>)
+    loadConfig()
       .then((c) => {
         if (cancelled) return
         configRef.current = c.asr
@@ -862,9 +937,13 @@ export function MicButton({ useSession, useInput, inputActions, skipPlayback, ca
       holdSourceRef.current = null
       return
     }
+    const source = holdSourceRef.current
     holdingRef.current = false
     holdSourceRef.current = null
-    suppressClickRef.current = true
+    // Only a pointer hold leaves a trailing click on the send key. A keyboard
+    // release has none, so setting the flag there would swallow the user's
+    // next real click on send.
+    if (source === 'pointer') suppressClickRef.current = true
     setHolding(false)
     setArmedCancel(false)
     armedCancelRef.current = false

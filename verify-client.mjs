@@ -68,8 +68,4 @@ if (!overlay || !overlay.hasComponent) throw new Error('shell.overlay voice entr
 if (!mic || !mic.hasComponent) throw new Error('conversation.input.right mic entry missing')
 console.log('5. both slot entries ok')
 
-// 4. native dynamic import must survive bundling (transformers CDN loader)
-if (!code.includes('import(')) throw new Error('native dynamic import was rewritten')
-console.log('6. native dynamic import preserved')
-
 console.log('ALL CHECKS PASSED')

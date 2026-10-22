@@ -94,7 +94,21 @@ export function createAsrEngine(
   // SenseVoice runs host-side (sherpa-onnx); the browser just POSTs raw
   // f32 PCM and reads the transcript back.
   const asrUrl = `${location.origin}${basePath.replace(/\/+$/, '')}/asr`
-  let transcribing = false
+  /**
+   * Final segments waiting for the recognizer, in capture order.
+   *
+   * A segment can finish while the previous one is still in flight (a 30s
+   * cap flush, or continuous dictation with short pauses). Dropping the new
+   * one — the old `if (transcribing) return` — loses speech silently, so
+   * segments queue up and drain serially instead.
+   */
+  const pendingSegments: Float32Array[] = []
+  let draining = false
+  /**
+   * Bumped by cancel(): an in-flight or queued final pass from the capture
+   * being discarded must not land in the draft afterwards.
+   */
+  let finalEpoch = 0
 
   // --- recorder fields ---
   let audioCtx: AudioContext | null = null
@@ -234,31 +248,44 @@ export function createAsrEngine(
     }
   }
 
-  const transcribeSegment = async (audio: Float32Array): Promise<void> => {
-    if (transcribing) return
-    transcribing = true
-    setState('transcribing')
+  /** Drain queued final segments, one host request at a time. */
+  const drainSegments = async (): Promise<void> => {
+    if (draining) return
+    draining = true
     try {
-      // Send the exact f32 buffer (little-endian) as binary; SenseVoice on
-      // the host decodes it and returns { text }.
-      // Copy out the exact view: Float32Array#buffer may be a pooled or
-      // shared buffer, which fetch's BodyInit does not accept.
-      const body = audio.slice().buffer as ArrayBuffer
-      const res = await fetch(asrUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/octet-stream' },
-        body,
-      })
-      if (!res.ok) throw new Error(`asr http ${res.status}`)
-      const out = (await res.json()) as { text?: string }
-      if (out.text) emitTranscript(out.text)
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn(`[dsh-voice] transcription failed: ${String(e)}`)
+      while (pendingSegments.length > 0) {
+        const audio = pendingSegments.shift()!
+        const epoch = finalEpoch
+        setState('transcribing')
+        try {
+          // Send the exact f32 buffer (little-endian) as binary; SenseVoice on
+          // the host decodes it and returns { text }.
+          // Copy out the exact view: Float32Array#buffer may be a pooled or
+          // shared buffer, which fetch's BodyInit does not accept.
+          const body = audio.slice().buffer as ArrayBuffer
+          const res = await fetch(asrUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/octet-stream' },
+            body,
+          })
+          if (!res.ok) throw new Error(`asr http ${res.status}`)
+          const out = (await res.json()) as { text?: string }
+          // A cancelled capture must not write its transcript into the draft.
+          if (epoch === finalEpoch && out.text) emitTranscript(out.text)
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn(`[dsh-voice] transcription failed: ${String(e)}`)
+        }
+      }
     } finally {
-      transcribing = false
+      draining = false
       setState(active ? (speechActive ? 'speech' : 'recording') : 'idle')
     }
+  }
+
+  const transcribeSegment = (audio: Float32Array): void => {
+    pendingSegments.push(audio)
+    void drainSegments()
   }
 
   const finalizeSegment = (): void => {
@@ -268,7 +295,7 @@ export function createAsrEngine(
     speechActive = false
     silenceMs = 0
     segmentMs = 0
-    void transcribeSegment(samples)
+    transcribeSegment(samples)
   }
 
   const flushWithPad = (): void => {
@@ -491,15 +518,19 @@ export function createAsrEngine(
     },
     async stop() {
       if (!active) {
-        setState('idle')
+        // A queued/draining final pass still owns the 'transcribing' state.
+        if (!draining) setState('idle')
         return
       }
       await stopRecorder()
-      if (!transcribing) setState('idle')
+      if (!draining) setState('idle')
     },
     async cancel() {
       // Discard the pending segment: nothing is transcribed, so no
-      // transcript reaches the composer draft.
+      // transcript reaches the composer draft. Queued passes are dropped and
+      // one already in flight is invalidated by the epoch check.
+      finalEpoch++
+      pendingSegments.length = 0
       await stopRecorder(true)
       setState('idle')
     },

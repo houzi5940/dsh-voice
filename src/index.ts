@@ -39,6 +39,15 @@ export const name = 'voice'
 
 export const inject = ['webServer']
 
+/**
+ * Fixed bootstrap path for `/config`.
+ *
+ * The client cannot know a custom `basePath` before it has talked to the
+ * host, so the config route is always reachable here; every other route is
+ * then addressed through the `basePath` the response carries.
+ */
+const BOOTSTRAP_BASE = '/dsh-voice-api'
+
 /** Plugin config. */
 export interface AsrRuntimeConfig {
   /** SenseVoice repo id on the hub (model.int8.onnx + tokens.txt inside). */
@@ -87,7 +96,7 @@ export const Config: z<Config> = z.object({
 })
 
 export function apply(ctx: Context, config: Config): void {
-  const base = config.basePath
+  const base = config.basePath.replace(/\/+$/, '') || BOOTSTRAP_BASE
 
   // --- SSE fan-out: every client connection receives every voice frame. ---
   const clients = new Set<(frame: VoiceFrame) => void>()
@@ -165,17 +174,23 @@ export function apply(ctx: Context, config: Config): void {
     }),
   )
 
-  ctx.effect(() =>
-    ctx.webServer.register({
-      kind: 'exact',
-      path: `${base}/config`,
-      handler: (_req, res) => {
-        res.statusCode = 200
-        res.setHeader('content-type', 'application/json')
-        res.end(JSON.stringify({ asr: config.asr, basePath: config.basePath }))
-      },
-    }),
-  )
+  const configHandler = (_req: unknown, res: ServerResponse): void => {
+    res.statusCode = 200
+    res.setHeader('content-type', 'application/json')
+    // Always report the normalized base so the client can build its URLs.
+    res.end(JSON.stringify({ asr: config.asr, basePath: base }))
+  }
+  // Serve /config on the configured base AND on the fixed bootstrap path,
+  // so a client that does not know a custom basePath can still discover it.
+  for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
+    ctx.effect(() =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: `${prefix}/config`,
+        handler: configHandler,
+      }),
+    )
+  }
 
   // --- SenseVoice ASR (host-side, via sherpa-onnx). ---
   // The browser records + segments audio and POSTs raw little-endian f32
@@ -216,7 +231,7 @@ export function apply(ctx: Context, config: Config): void {
   const touchSession = (id: string): void => {
     asrSessionTouch.set(id, Date.now())
   }
-  setInterval(() => {
+  const sessionSweeper = setInterval(() => {
     const now = Date.now()
     for (const [id, last] of asrSessionTouch) {
       if (now - last > SESSION_TTL_MS) {
@@ -224,7 +239,8 @@ export function apply(ctx: Context, config: Config): void {
         asrSessionTouch.delete(id)
       }
     }
-  }, 30_000).unref()
+  }, 30_000)
+  sessionSweeper.unref()
 
   const decodeSamples = (samples: Float32Array): string => {
     const rec = getRecognizer()
@@ -328,6 +344,16 @@ export function apply(ctx: Context, config: Config): void {
       },
     }),
   )
+
+  // --- teardown: release the recognizer, the TTS socket and the sweep timer.
+  // A plugin reload would otherwise retain a whole SenseVoice model (hundreds
+  // of MB) and an Edge TTS WebSocket per generation.
+  ctx.effect(() => () => {
+    clearInterval(sessionSweeper)
+    recognizer?.free()
+    recognizer = null
+    void queue.close().catch(() => undefined)
+  })
 }
 
 /**
@@ -344,7 +370,7 @@ const MODEL_MIME: Record<string, string> = {
 /**
  * Cache-through model server: local hit (with byte-range support) first,
  * otherwise fetch upstream, forward the body, and mirror complete
- * (non-range) 200 responses into the on-disk cache.
+ * (non-range) 200 responses — or a verified resume — into the on-disk cache.
  */
 async function serveModel(
   localPath: string,
@@ -383,6 +409,15 @@ async function serveModel(
       return
     }
   }
+  // Append to a partial file ONLY when the upstream honoured exactly the
+  // resume offset we asked for. Some mirror edge nodes ignore Range and answer
+  // 200 with the whole body; appending that to a .part file produces a corrupt
+  // model whose failure only surfaces much later, at load time.
+  const resumeFrom = partSt?.size ?? 0
+  const contentRange = up.headers.get('content-range')
+  const rangeStart = contentRange === null ? NaN : Number(/^bytes (\d+)-/.exec(contentRange)?.[1] ?? NaN)
+  const appending = up.status === 206 && resumeFrom > 0 && rangeStart === resumeFrom
+
   res.statusCode = up.status
   const pass = (name: string): void => {
     const value = up.headers.get(name)
@@ -400,8 +435,9 @@ async function serveModel(
     return
   }
   const body = Readable.fromWeb(up.body as never)
-  const cacheable =
-    (up.status === 200 || up.status === 206) && !headers.range && !inflight.has(localPath)
+  // A 206 is only cacheable when it is a verified resume of our own .part
+  // file; an unverifiable partial response is streamed but never written.
+  const cacheable = (up.status === 200 || appending) && !headers.range && !inflight.has(localPath)
   if (!cacheable) {
     body.pipe(res)
     return
@@ -416,7 +452,9 @@ async function serveModel(
     body.pipe(res)
     return
   }
-  const sink = createWriteStream(partPath, partSt?.size ? { flags: 'a' } : {})
+  // Resume appends; anything else starts the temp file over so a mirror that
+  // ignored Range cannot leave half of a duplicate object behind.
+  const sink = createWriteStream(partPath, appending ? { flags: 'a' } : {})
   const tee = new PassThrough()
   tee.pipe(res)
   tee.pipe(sink)
@@ -479,6 +517,7 @@ async function* tapStream(
   const segmenter = new SentenceSegmenter()
   sessionSegmenters.set(sessionId, segmenter)
   let flushed = false
+  let completed = false
   let finishReason: unknown = null
   const flushOnce = (): void => {
     if (flushed) return
@@ -493,14 +532,17 @@ async function* tapStream(
       if (chunk.type === 'finish') finishReason = chunk.reason
       yield chunk
     }
+    completed = true
   } finally {
-    // A barge-in aborts the turn: the trailing half-sentence is exactly what
-    // the user interrupted, so it must not be spoken.
+    // Only a turn that actually completed may flush its trailing buffer.
+    // A barge-in aborts the turn (the half-sentence is what the user
+    // interrupted), and a stream that throws has no known ending either —
+    // speaking the fragment would invent the rest of the sentence.
     const aborted =
       finishReason !== null &&
       typeof finishReason === 'object' &&
       (finishReason as { kind?: unknown }).kind === 'aborted'
-    if (!aborted) flushOnce()
+    if (completed && !aborted) flushOnce()
     sessionSegmenters.delete(sessionId)
   }
 }

@@ -49,8 +49,6 @@ await build({
   format: 'cjs',
   platform: 'browser',
   jsx: 'automatic',
-  // Keep the native import() for the transformers.js CDN ESM bundle.
-  supported: { 'dynamic-import': true },
   external: PLATFORM_EXTERNALS,
   banner: {
     js:
@@ -65,12 +63,17 @@ await build({
 
 console.log('[dsh-voice] build done: lib/index.js (host) + lib/client.js (browser)')
 
-// --- test surface: standalone segmenter build for the unit test ---
-await build({
-  entryPoints: ['src/segmenter.ts'],
-  outfile: 'lib/segmenter.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
+// --- test surface: standalone modules for the plain-node tests ---
+for (const [entry, outfile] of [
+  ['src/segmenter.ts', 'lib/segmenter.js'],
+  ['src/tts-queue.ts', 'lib/tts-queue.js'],
+]) {
+  await build({
+    entryPoints: [entry],
+    outfile,
+    bundle: false,
+    format: 'esm',
+    platform: 'node',
+    logLevel: 'silent',
+  })
+}

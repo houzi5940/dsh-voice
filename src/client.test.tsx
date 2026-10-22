@@ -65,18 +65,20 @@ vi.mock('./asr.ts', () => ({
   },
 }))
 
-const { VoicePanel, MicButton } = await import('./client.tsx')
+const { VoicePanel, MicButton, __resetVoiceConfigCache } = await import('./client.tsx')
 
 /** Fake audio engine: `push` drives the panel through subscribe(). */
 function fakeAudioEngine(): VoicePanelActions & {
   push(next: AudioState): void
   connect: ReturnType<typeof vi.fn>
+  disconnect: ReturnType<typeof vi.fn>
   skip: ReturnType<typeof vi.fn>
 } {
   const listeners = new Set<(s: AudioState) => void>()
   let state: AudioState = { connected: false, playing: false, caption: null }
   return {
     connect: vi.fn(),
+    disconnect: vi.fn(),
     skip: vi.fn(),
     subscribe(fn: (s: AudioState) => void) {
       listeners.add(fn)
@@ -97,6 +99,9 @@ const hostConfig = {
 
 beforeEach(() => {
   engineHandles.current = null
+  // The config is cached per page load; reset it so each test's fetch stub
+  // (and hotkey/basePath) takes effect.
+  __resetVoiceConfigCache()
   vi.stubGlobal('fetch', vi.fn(async () => ({
     ok: true,
     status: 200,
@@ -467,6 +472,18 @@ describe('press-to-talk on the composer send key', () => {
     const onSend = vi.fn()
     const { send } = await composer()
     send.addEventListener('click', onSend)
+    fireEvent.click(send)
+    expect(onSend).toHaveBeenCalledOnce()
+  })
+
+  it('a keyboard release does not swallow the next send click', async () => {
+    const onSend = vi.fn()
+    const { send } = await composer()
+    send.addEventListener('click', onSend)
+    fireEvent.keyDown(window, { key: 'Control' })
+    await act(async () => { await vi.advanceTimersByTimeAsync(700) })
+    fireEvent.keyUp(window, { key: 'Control' })
+    // No pointerup followed this hold, so there is no trailing click to eat.
     fireEvent.click(send)
     expect(onSend).toHaveBeenCalledOnce()
   })

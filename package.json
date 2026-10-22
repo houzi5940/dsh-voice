@@ -18,7 +18,7 @@
   "scripts": {
     "build": "node build.mjs",
     "test": "npm run test:host && npm run test:client",
-    "test:host": "node test/segmenter.test.mjs && node test/bargein.test.mjs && node test/bargein-semantics.test.mjs && node test/host.integration.test.mjs",
+    "test:host": "node test/segmenter.test.mjs && node test/tts-retry.test.mjs && node test/bargein.test.mjs && node test/bargein-semantics.test.mjs && node test/host.integration.test.mjs",
     "test:client": "vitest run",
     "prefetch": "node scripts/prefetch.mjs"
   },
@@ -35,7 +35,7 @@
     }
   },
   "dependencies": {
-    "msedge-tts": "^2.0.7",
+    "msedge-tts": "^2.1.0",
     "sherpa-onnx": "^1.13.5"
   },
   "peerDependencies": {

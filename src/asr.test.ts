@@ -270,6 +270,79 @@ describe('interim transcripts', () => {
   })
 })
 
+/**
+ * Final-pass serialization.
+ *
+ * A segment can be finalized while the previous one is still in flight (short
+ * pauses in continuous dictation, or a 30s cap flush). Dropping it — the old
+ * `if (transcribing) return` — loses that speech entirely.
+ */
+describe('queued final segments', () => {
+  let audio: { tick(a: number): void }
+  beforeEach(() => { audio = installFakeAudio() })
+
+  it('transcribes a segment that finishes while the previous POST is in flight', async () => {
+    let releaseFirst: (() => void) | null = null
+    let calls = 0
+    vi.stubGlobal('fetch', async (_url: string, _init: { body: ArrayBuffer }) => {
+      const n = ++calls
+      if (n === 1) await new Promise<void>((r) => { releaseFirst = r })
+      return { ok: true, status: 200, json: async () => ({ text: `第${n}段` }) }
+    })
+    const engine = createAsrEngine(cfg, '/dsh-voice-api')
+    const seen: string[] = []
+    engine.onSegment((t) => seen.push(t))
+
+    await engine.start()
+    // Segment 1: 2.24s of speech + >2s trailing silence flushes it.
+    for (let i = 0; i < 35; i++) audio.tick(0.25)
+    for (let i = 0; i < 40; i++) audio.tick(0)
+    await settle()
+    expect(calls).toBe(1) // first request is held open
+
+    // Segment 2 finalizes while segment 1 is still in flight: it must queue,
+    // not vanish.
+    for (let i = 0; i < 35; i++) audio.tick(0.25)
+    for (let i = 0; i < 40; i++) audio.tick(0)
+    await settle()
+    expect(calls).toBe(1)
+
+    releaseFirst?.()
+    await settle()
+    await settle()
+    await settle()
+    expect(calls).toBe(2)
+    expect(seen).toEqual(['第1段', '第2段'])
+
+    await engine.stop()
+  })
+
+  it('cancel drops queued passes and discards the in-flight transcript', async () => {
+    let release: (() => void) | null = null
+    vi.stubGlobal('fetch', async () => {
+      await new Promise<void>((r) => { release = r })
+      return { ok: true, status: 200, json: async () => ({ text: '不该出现' }) }
+    })
+    const engine = createAsrEngine(cfg, '/dsh-voice-api')
+    const seen: string[] = []
+    engine.onSegment((t) => seen.push(t))
+
+    await engine.start({ hold: true })
+    for (let i = 0; i < 30; i++) audio.tick(0.25)
+    await engine.stop() // final pass starts, then stays in flight
+    await settle()
+    expect(release).not.toBeNull()
+
+    await engine.start({ hold: true }) // a new capture begins
+    await engine.cancel() // and is discarded
+    release?.()
+    await settle()
+
+    expect(seen).toEqual([])
+    expect(engine.state).toBe('idle')
+  })
+})
+
 describe('incremental interim transcripts', () => {
   let audio: { tick(a: number): void }
   beforeEach(() => { audio = installFakeAudio() })

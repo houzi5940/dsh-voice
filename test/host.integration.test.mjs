@@ -106,6 +106,41 @@ console.log('  ok  routes registered')
   console.log('  ok  /config exposes the press-to-talk hotkey:', parsed.asr.hotkey)
 }
 
+// A custom basePath must still expose /config on the fixed bootstrap path,
+// otherwise the client can never discover where the other routes live.
+{
+  const customRoutes = []
+  const customCtx = {
+    on() {},
+    effect(fn) {
+      fn()
+      return () => {}
+    },
+    webServer: {
+      register(route) {
+        customRoutes.push(route)
+        return () => {}
+      },
+    },
+  }
+  apply(customCtx, { ...config, basePath: '/custom-voice', enabled: false })
+  const paths = customRoutes.map((r) => r.path)
+  if (!paths.includes('/custom-voice/config')) {
+    throw new Error('custom config route missing: ' + paths.join(', '))
+  }
+  if (!paths.includes('/dsh-voice-api/config')) {
+    throw new Error('bootstrap config route missing: ' + paths.join(', '))
+  }
+  const bootstrap = customRoutes.find((r) => r.path === '/dsh-voice-api/config')
+  let body = ''
+  bootstrap.handler({}, { setHeader() {}, end(s) { body = s } })
+  const parsed = JSON.parse(body)
+  if (parsed.basePath !== '/custom-voice') {
+    throw new Error('bootstrap /config reports the wrong base: ' + body)
+  }
+  console.log('  ok  custom basePath is discoverable via the bootstrap /config')
+}
+
 // Config schema defaults: hotkey must default to Control (the client treats
 // an empty string as "keyboard route off").
 {
