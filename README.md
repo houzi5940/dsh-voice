@@ -6,7 +6,7 @@ Full-duplex voice mode for DeepSeek Harness: streamed ASR → LLM → TTS with b
 
 ## Status
 
-**v0.8.0 — press-to-talk with a live caption.**
+**v0.8.1 — press-to-talk with a live caption.**
 
 Speak into the composer mic: the assistant silences itself (playback stops,
 host synthesis queue drops), the running turn is cancelled (the stop-button
