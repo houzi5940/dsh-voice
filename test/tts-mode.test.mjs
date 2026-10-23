@@ -41,7 +41,7 @@ function baseConfig(overrides) {
   }
 }
 
-async function collectFrames(ttsMode) {
+async function collectFrames(ttsMode, streamFactory) {
   const capture = { listeners: new Map(), routes: [] }
   const ctx = makeCtx(capture)
   apply(ctx, baseConfig(ttsMode ? { tts: { mode: ttsMode } } : undefined))
@@ -62,16 +62,20 @@ async function collectFrames(ttsMode) {
   const sse = capture.routes.find((r) => r.path === '/dsh-voice-api/stream')
   sse.handler({ on() {} }, res)
 
-  async function* mockStream() {
-    yield { type: 'text-delta', index: 0, text: '第一句说完。' }
-    yield { type: 'text-delta', index: 0, text: '第二句。第三句。' }
-    yield { type: 'finish', reason: { kind: 'stop' } }
-  }
+  const makeStream =
+    streamFactory !== undefined
+      ? () => streamFactory
+      : async function* mockStream() {
+          yield { type: 'text-delta', index: 0, text: '第一句说完。' }
+          yield { type: 'text-delta', index: 0, text: '第二句。第三句。' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        }
   const seen = []
-  for await (const chunk of llmStream({ sessionId: 's1' }, mockStream)) seen.push(chunk)
+  for await (const chunk of llmStream({ sessionId: 's1' }, makeStream)) seen.push(chunk)
 
   const deadline = Date.now() + 20000
-  const target = ttsMode === 'off' ? 0 : ttsMode === 'first' ? 1 : 3
+  const targets = { all: 3, first: 1, off: 0, paragraph: 2 }
+  const target = targets[ttsMode] ?? 3
   while (frames.length < target && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 200))
   }
@@ -142,6 +146,23 @@ async function collectFrames(ttsMode) {
   // new Config(...); the live /config probe in host.integration covers the
   // end-to-end resolution (autoSend/silenceMs/hotkey all materialize).
   console.log('  ok  config: volatile defaults in schema meta, floor enforced')
+}
+
+// --- 'paragraph': the first paragraph streams; later paragraphs are muted ---
+{
+  async function* twoParagraphs() {
+    // Split deltas mimic real streaming; the blank line straddles chunks.
+    yield { type: 'text-delta', index: 0, text: '结论先行：可以。' }
+    yield { type: 'text-delta', index: 0, text: '依据如下。\n' }
+    yield { type: 'text-delta', index: 0, text: '\n第二段展开讲。还有第三句。' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const { frames, seen } = await collectFrames('paragraph', twoParagraphs())
+  if (seen.length !== 4) throw new Error(`'paragraph' tap corrupted: ${seen.length} chunks`)
+  if (frames.length !== 2) throw new Error(`'paragraph' expected 2 frames, got ${frames.length}`)
+  if (frames[0].text !== '结论先行：可以。') throw new Error('paragraph frame[0] wrong: ' + frames[0].text)
+  if (frames[1].text !== '依据如下。') throw new Error('paragraph frame[1] wrong: ' + frames[1].text)
+  console.log("  ok  mode 'paragraph': spoke the first paragraph, muted the rest")
 }
 
 console.log('\nALL TTS-MODE TESTS PASSED')

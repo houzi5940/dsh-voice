@@ -28,7 +28,7 @@ const { createOfflineRecognizer } = sherpa_onnx as unknown as {
   createOfflineRecognizer(config: Record<string, unknown>): SherpaRecognizer
 }
 
-import { SentenceSegmenter } from './segmenter.ts'
+import { ParagraphGate, SentenceSegmenter } from './segmenter.ts'
 import { TtsQueue, type VoiceFrame } from './tts-queue.ts'
 
 /**
@@ -74,10 +74,12 @@ export interface TtsRuntimeConfig {
    *
    * - 'first': speak only the first sentence of each turn (brief spoken
    *   reply, full text stays in the conversation).
+   * - 'paragraph': speak the first paragraph (up to the first blank line),
+   *   streaming; longer answers stay silent after the opening paragraph.
    * - 'all': speak every sentence (upstream behavior).
    * - 'off': never synthesize; TTS is effectively muted.
    */
-  mode: 'first' | 'all' | 'off'
+  mode: 'first' | 'paragraph' | 'all' | 'off'
 }
 
 export interface Config {
@@ -122,7 +124,12 @@ export const Config: z<Config> = z.object({
   tts: z
     .object({
       mode: z
-        .union([z.const('first'), z.const('all'), z.const('off')])
+        .union([
+          z.const('first'),
+          z.const('paragraph'),
+          z.const('all'),
+          z.const('off'),
+        ])
         .default('all')
         .volatile(),
     })
@@ -188,7 +195,7 @@ export function apply(ctx: Context, config: Config): void {
   const sessionSegmenters = new Map<string, SentenceSegmenter>()
   // Older configs may predate tts.mode; default to speaking everything.
   // tts.mode is volatile: resolve per turn so a settings write applies live.
-  const ttsMode = (): 'first' | 'all' | 'off' => live(config.tts?.mode) ?? 'all'
+  const ttsMode = (): TtsRuntimeConfig['mode'] => live(config.tts?.mode) ?? 'all'
   ctx.on('llm/stream', (options: GenerateOptions, next): AsyncIterable<StreamChunk> => {
     const sessionId = options.sessionId
     if (!live(config.enabled) || sessionId === undefined) return next()
@@ -596,7 +603,7 @@ function serveLocal(
 function speakable(
   sentences: string[],
   spokenThisTurn: () => boolean,
-  mode: 'first' | 'all' | 'off',
+  mode: TtsRuntimeConfig['mode'],
 ): string[] {
   if (mode === 'off') return []
   if (mode !== 'first') return sentences
@@ -609,10 +616,14 @@ async function* tapStream(
   inner: AsyncIterable<StreamChunk>,
   queue: TtsQueue,
   sessionSegmenters: Map<string, SentenceSegmenter>,
-  ttsMode: 'first' | 'all' | 'off',
+  ttsMode: TtsRuntimeConfig['mode'],
 ): AsyncIterable<StreamChunk> {
   const segmenter = new SentenceSegmenter()
   sessionSegmenters.set(sessionId, segmenter)
+  // 'paragraph' needs the raw text to see blank lines, so it swaps the
+  // sentence feed for a ParagraphGate that speaks only the first paragraph
+  // and streams (it starts synthesizing before the turn ends).
+  const gate = ttsMode === 'paragraph' ? new ParagraphGate() : null
   let flushed = false
   let completed = false
   let finishReason: unknown = null
@@ -621,7 +632,8 @@ async function* tapStream(
   const flushOnce = (): void => {
     if (flushed) return
     flushed = true
-    for (const s of speakable(segmenter.flush(), spokeAlready, ttsMode)) {
+    const tail = gate ? gate.flush() : speakable(segmenter.flush(), spokeAlready, ttsMode)
+    for (const s of tail) {
       spoke = true
       queue.enqueue(sessionId, s)
     }
@@ -629,7 +641,10 @@ async function* tapStream(
   try {
     for await (const chunk of inner) {
       if (chunk.type === 'text-delta' && chunk.text) {
-        for (const s of speakable(segmenter.feed(chunk.text), spokeAlready, ttsMode)) {
+        const sentences = gate
+          ? gate.feed(chunk.text)
+          : speakable(segmenter.feed(chunk.text), spokeAlready, ttsMode)
+        for (const s of sentences) {
           spoke = true
           queue.enqueue(sessionId, s)
         }

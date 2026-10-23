@@ -1,5 +1,5 @@
 // Sentence segmenter unit test (runs on plain Node, no harness needed).
-import { SentenceSegmenter, plainText, splitSentences } from '../lib/segmenter.js'
+import { ParagraphGate, SentenceSegmenter, plainText, splitSentences } from '../lib/segmenter.js'
 
 let failures = 0
 function assert(cond, label) {
@@ -87,6 +87,56 @@ assert(!cleaned.includes('**') && !cleaned.includes('```') && cleaned.includes('
     out.length === 1 && out[0] === '用 npm install 装。',
     'inline code survives across deltas: ' + JSON.stringify(out),
   )
+}
+
+
+// --- ParagraphGate (tts.mode = 'paragraph'): speak only the first paragraph ---
+
+// P1. first-paragraph sentences stream out; the second paragraph is dropped
+{
+  const gate = new ParagraphGate()
+  const a = gate.feed('第一段第一句。')
+  const b = gate.feed('第一段第二句！\n\n')
+  const c = gate.feed('第二段第一句。第二段结束。')
+  const f = gate.flush()
+  assert(a.length === 1 && a[0] === '第一段第一句。', 'P1: first sentence streams')
+  assert(b.length === 1 && b[0] === '第一段第二句！', 'P1: second sentence streams before blank line')
+  assert(c.length === 0, 'P1: everything after the blank line is dropped')
+  assert(f.length === 0, 'P1: nothing left to flush')
+}
+
+// P2. blank line split across chunks is detected (the trailing "\n" is held)
+{
+  const gate = new ParagraphGate()
+  const a = gate.feed('首段说完。\n')
+  const b = gate.feed('\n第二段开始。到此。')
+  assert(a.length === 1 && a[0] === '首段说完。', 'P2: held line break does not emit early')
+  assert(b.length === 0, 'P2: cross-chunk blank line closes the gate')
+}
+
+// P3. no blank line anywhere: the whole turn is the first paragraph
+{
+  const gate = new ParagraphGate()
+  const a = gate.feed('一句。')
+  const b = gate.feed('两句。')
+  const f = gate.flush()
+  assert(a.length === 1 && b.length === 1, 'P3: sentences stream without a blank line')
+  assert(f.length === 0, 'P3: no residue to flush')
+}
+
+// P4. single-line turn: flush speaks the unterminated tail
+{
+  const gate = new ParagraphGate()
+  gate.feed('没有标点的结尾')
+  const f = gate.flush()
+  assert(f.length === 1 && f[0] === '没有标点的结尾', 'P4: unterminated first paragraph flushes')
+}
+
+// P5. leading blank line before any text: nothing is spoken
+{
+  const gate = new ParagraphGate()
+  const a = gate.feed('\n\n正文第一句。')
+  assert(a.length === 0, 'P5: leading blank line closes before any speech')
 }
 
 console.log(failures === 0 ? '\nALL SEGMENTER TESTS PASSED' : `\n${failures} TEST(S) FAILED`)

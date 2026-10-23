@@ -252,3 +252,54 @@ export class SentenceSegmenter {
     return []
   }
 }
+
+/**
+ * Speak-gate for `tts.mode = 'paragraph'`: lets the first paragraph's
+ * sentences through the segmenter and drops everything after the first
+ * blank line, streaming — the boundary is detected as raw deltas arrive,
+ * so speech starts before the turn finishes.
+ *
+ * A blank line spans chunks easily ("…\n" then "\n…"), so a trailing lone
+ * line break is held back until the next delta proves it is not the first
+ * half of one. Everything fed before a proven blank line belongs to the
+ * first paragraph by construction; the blank line itself never yields a
+ * speakable sentence (pure whitespace is filtered), which is what makes
+ * eager feeding safe.
+ */
+export class ParagraphGate {
+  private readonly seg = new SentenceSegmenter()
+  /** Unfed raw text that may still turn out to precede a blank line. */
+  private tail = ''
+  /** True once the first blank line has been consumed. */
+  private closed = false
+
+  /** Feed a raw delta; returns first-paragraph sentences it completes. */
+  feed(chunk: string): string[] {
+    if (this.closed) return []
+    const window = this.tail + chunk
+    this.tail = ''
+    const blank = /\n[ \t]*\n/.exec(window)
+    if (blank !== null) {
+      this.closed = true
+      return this.seg.feed(window.slice(0, blank.index))
+    }
+    // Hold back a trailing line break: the next delta may open with the
+    // second half of a blank line ("。\n" + "\n段落二…").
+    const hold = /[ \t]*\n[ \t]*$/.exec(window)
+    if (hold !== null) {
+      this.tail = hold[0]
+      return this.seg.feed(window.slice(0, window.length - hold[0].length))
+    }
+    return this.seg.feed(window)
+  }
+
+  /**
+   * End of turn. Without a blank line the whole turn is one paragraph, so
+   * the buffered tail speaks; after one, the buffer holds the first
+   * paragraph's unterminated tail, which also speaks.
+   */
+  flush(): string[] {
+    this.tail = ''
+    return this.seg.flush()
+  }
+}

@@ -1353,7 +1353,8 @@ interface FormSnapshot {
 }
 
 const TTS_MODES: Array<{ value: string; label: string; hint: string }> = [
-  { value: 'first', label: '只播首句', hint: '每轮回答只朗读第一句，其余仅在会话中显示（推荐语音对话）' },
+  { value: 'first', label: '只播首句', hint: '每轮回答只朗读第一句，其余仅在会话中显示（最简短）' },
+  { value: 'paragraph', label: '朗读首段', hint: '朗读回答的第一段（到第一个空行为止），其余仅显示（推荐：既有内容感又不啰嗦）' },
   { value: 'all', label: '整篇朗读', hint: '逐句朗读完整回答（原版行为）' },
   { value: 'off', label: '静音', hint: '只输入不朗读；麦克风与停顿发送不受影响' },
 ]
