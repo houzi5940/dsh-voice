@@ -402,7 +402,21 @@ export function createAsrEngine(
     if (active) return
     // When no explicit echo reference is available, keep the browser's own
     // AEC (getUserMedia constraint) as the safety net.
-    const echoRef = getEchoReference?.()?.node ?? null
+    // Build the capture context first: the echo reference is only usable when
+    // it lives in THIS context. The TTS element is wired into the page's
+    // shared playback context, so connecting its node here throws
+    // InvalidStateError ("cannot connect to a node in a different context")
+    // and took the whole recording down with it. A mismatched reference falls
+    // back to the browser's own echo cancellation — degraded AEC is far better
+    // than a dead microphone.
+    audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE })
+    if (audioCtx.state === 'suspended') await audioCtx.resume()
+    const rawRef = getEchoReference?.()?.node ?? null
+    const echoRef = rawRef !== null && rawRef.context === audioCtx ? rawRef : null
+    if (rawRef !== null && echoRef === null) {
+      // eslint-disable-next-line no-console
+      console.warn('[dsh-voice] echo reference belongs to another AudioContext; using browser AEC')
+    }
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -411,7 +425,6 @@ export function createAsrEngine(
         autoGainControl: true,
       },
     })
-    audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE })
     const source = audioCtx.createMediaStreamSource(stream)
     if (echoRef === null) {
       processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1)
@@ -436,6 +449,33 @@ export function createAsrEngine(
     }
     processor.connect(audioCtx.destination)
     active = true
+  }
+
+  /**
+   * Release a half-built capture: stop the mic tracks and close the context,
+   * so the next attempt starts clean instead of hitting a busy device or the
+   * browser's AudioContext limit.
+   */
+  const releaseCapture = async (): Promise<void> => {
+    try {
+      stream?.getTracks().forEach((t) => t.stop())
+    } catch {
+      // ignore
+    }
+    stream = null
+    try {
+      processor?.disconnect()
+    } catch {
+      // ignore
+    }
+    processor = null
+    try {
+      await audioCtx?.close()
+    } catch {
+      // ignore
+    }
+    audioCtx = null
+    active = false
   }
 
   const stopRecorder = async (discard = false): Promise<void> => {
@@ -517,8 +557,9 @@ export function createAsrEngine(
       try {
         await startRecorder()
       } catch (error) {
-        // getUserMedia denial / AudioContext failure must not leave the
-        // engine advertising 'recording' forever.
+        // getUserMedia denial, AudioContext failure, or a graph-connection
+        // error must release the device and leave no 'recording' state.
+        await releaseCapture()
         holdMode = false
         setState('idle')
         throw error

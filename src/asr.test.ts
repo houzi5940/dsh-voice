@@ -14,7 +14,7 @@ import { createAsrEngine, type AsrConfig } from './asr.ts'
 const BUFFER = 1024
 
 /** Minimal browser surface the engine touches, with a scriptable mic. */
-function installFakeAudio(): { tick(amplitude: number): void } {
+function installFakeAudio(): { tick(amplitude: number): void; ctx: unknown; constraints(): unknown } {
   let onaudioprocess: ((e: unknown) => void) | null = null
   const processor = {
     set onaudioprocess(fn: (e: unknown) => void) { onaudioprocess = fn },
@@ -29,11 +29,19 @@ function installFakeAudio(): { tick(amplitude: number): void } {
     close: async () => {},
   }
   vi.stubGlobal('AudioContext', function AudioContextStub() { return ctx })
+  let constraints: unknown = null
   vi.stubGlobal('navigator', {
-    mediaDevices: { getUserMedia: async () => ({ getTracks: () => [] }) },
+    mediaDevices: {
+      getUserMedia: async (request: unknown) => {
+        constraints = request
+        return { getTracks: () => [] }
+      },
+    },
   })
   vi.stubGlobal('location', { origin: 'http://127.0.0.1:3080' })
   return {
+    ctx,
+    constraints: () => constraints,
     tick(amplitude: number) {
       const data = new Float32Array(BUFFER)
       for (let i = 0; i < BUFFER; i++) data[i] = amplitude * (i % 2 === 0 ? 1 : -1)
@@ -382,5 +390,53 @@ describe('incremental interim transcripts', () => {
     expect(calls[1].session).toBe(calls[0].session)
 
     await engine.cancel()
+  })
+})
+
+// A TTS echo reference lives in the page's playback AudioContext; the capture
+// context is a separate 16kHz one, so `ref.connect(processor)` throws
+// InvalidStateError. The recorder must fall back to browser AEC instead of
+// failing the whole capture ("麦克风不可用").
+describe('echo reference across AudioContexts', () => {
+  it('falls back to browser AEC when the reference belongs to another context', async () => {
+    const audio = installFakeAudio()
+    const posts = installFetchCapture('跨上下文也没关系')
+    const foreign = {
+      context: {},
+      connect() {
+        throw new Error('cannot connect to a node in a different context')
+      },
+    }
+    const engine = createAsrEngine(cfg, '/dsh-voice-api', () => ({ node: foreign as never }))
+    const seen: string[] = []
+    engine.onSegment((t) => seen.push(t))
+
+    await engine.start({ hold: true })
+    for (let i = 0; i < 12; i++) audio.tick(0.05) // ~0.77s, above the mis-tap floor
+    await engine.stop()
+    await settle()
+
+    const request = audio.constraints() as { audio: { echoCancellation: boolean } }
+    expect(request.audio.echoCancellation).toBe(true)
+    expect(posts).toHaveLength(1)
+    expect(seen).toEqual(['跨上下文也没关系'])
+  })
+
+  it('keeps the NLMS path when the reference shares the capture context', async () => {
+    const audio = installFakeAudio()
+    installFetchCapture('AEC 可用')
+    const connect = vi.fn()
+    const engine = createAsrEngine(cfg, '/dsh-voice-api', () => ({
+      node: { context: audio.ctx, connect } as never,
+    }))
+
+    await engine.start({ hold: true })
+    for (let i = 0; i < 12; i++) audio.tick(0.05)
+    await engine.stop()
+    await settle()
+
+    const request = audio.constraints() as { audio: { echoCancellation: boolean } }
+    expect(request.audio.echoCancellation).toBe(false)
+    expect(connect).toHaveBeenCalled()
   })
 })

@@ -702,6 +702,8 @@ function PressToTalkOverlay({
  *
  * Browsers report permission problems through DOMException names, and the raw
  * message ("Permission denied") does not tell the user where to fix it.
+ * Unknown failures keep the error NAME: "麦克风不可用" alone is unactionable,
+ * while "NotSupportedError: …" points straight at the audio stack.
  */
 function micErrorMessage(err: unknown): string {
   const name = err instanceof DOMException ? err.name : ''
@@ -715,9 +717,102 @@ function micErrorMessage(err: unknown): string {
       return '找不到麦克风设备：请检查系统输入设备'
     case 'NotReadableError':
       return '麦克风被其他程序占用'
+    case 'NotSupportedError':
+      return `音频功能不可用（NotSupportedError）：${raw || '浏览器无法创建音频上下文，刷新页面后重试'}`
+    case 'AbortError':
+      return '录音启动被中断：请重试'
+    case 'InvalidStateError':
+      return `录音状态异常（InvalidStateError）：${raw || '刷新页面后重试'}`
     default:
-      return raw ? `麦克风不可用：${raw}` : '麦克风不可用'
+      return raw ? `麦克风不可用（${name || 'Error'}）：${raw}` : '麦克风不可用'
   }
+}
+
+/** One line of the microphone self-check. */
+interface MicCheck {
+  label: string
+  ok: boolean
+  detail: string
+}
+
+function errorDetail(err: unknown): string {
+  const name = err instanceof DOMException || err instanceof Error ? err.name : ''
+  const raw = err instanceof Error ? err.message : String(err)
+  return name ? `${name}: ${raw}` : raw
+}
+
+/**
+ * Walk the whole capture chain and report each link, so "麦克风不可用" turns
+ * into "this exact step failed, with this exact error name". The checks are
+ * ordered from the page environment outward to the Host; the first failing
+ * line is almost always the cause.
+ */
+async function runMicDiagnostics(): Promise<MicCheck[]> {
+  const checks: MicCheck[] = []
+  const add = (label: string, ok: boolean, detail: string): void => {
+    checks.push({ label, ok, detail })
+  }
+
+  add(
+    '安全上下文',
+    window.isSecureContext,
+    window.isSecureContext
+      ? 'isSecureContext = true（localhost / HTTPS）'
+      : '非安全上下文：浏览器会禁用麦克风，请用 localhost 或 HTTPS 打开',
+  )
+
+  const md = navigator.mediaDevices
+  add('MediaDevices API', md !== undefined, md !== undefined ? '可用' : 'navigator.mediaDevices 不存在')
+
+  if (md !== undefined) {
+    try {
+      const status = await navigator.permissions?.query({ name: 'microphone' as PermissionName })
+      const state = status?.state ?? 'unknown'
+      add(
+        '麦克风权限',
+        state === 'granted',
+        state === 'granted' ? '已授权' : state === 'denied' ? '已被拒绝（需在站点权限里重新允许）' : '尚未决定（首次录音会弹出授权）',
+      )
+    } catch {
+      add('麦克风权限', true, '浏览器不支持权限查询，跳过')
+    }
+
+    try {
+      const devices = await md.enumerateDevices()
+      const mics = devices.filter((d) => d.kind === 'audioinput')
+      const names = mics.map((m) => m.label || `设备 ${m.deviceId.slice(0, 6)}`).join('、')
+      add('输入设备', mics.length > 0, mics.length > 0 ? `${mics.length} 个：${names}` : '未发现音频输入设备')
+    } catch (e) {
+      add('输入设备', false, errorDetail(e))
+    }
+
+    let stream: MediaStream | null = null
+    try {
+      stream = await md.getUserMedia({ audio: true })
+      add('getUserMedia', true, '已获取麦克风音轨')
+    } catch (e) {
+      add('getUserMedia', false, errorDetail(e))
+    } finally {
+      stream?.getTracks().forEach((t) => t.stop())
+    }
+  }
+
+  try {
+    const ctx = new AudioContext({ sampleRate: 16000 })
+    add('AudioContext(16k)', true, `state=${ctx.state}，实际采样率 ${ctx.sampleRate}Hz`)
+    await ctx.close()
+  } catch (e) {
+    add('AudioContext(16k)', false, errorDetail(e))
+  }
+
+  try {
+    const res = await fetch(apiUrl('/config'), { cache: 'no-store' })
+    add('Host 语音服务', res.ok, res.ok ? '已连接' : `HTTP ${res.status}`)
+  } catch (e) {
+    add('Host 语音服务', false, errorDetail(e))
+  }
+
+  return checks
 }
 
 /**
@@ -1410,6 +1505,8 @@ function VoiceConfigPage({
   const ttsMode = typeof tts['mode'] === 'string' ? (tts['mode'] as string) : 'all'
   const [silenceText, setSilenceText] = useState<string | null>(null)
   const shownSilence = silenceText ?? String(silenceMs)
+  const [checks, setChecks] = useState<MicCheck[] | null>(null)
+  const [checking, setChecking] = useState(false)
 
   const write = async (ops: Array<{ op: string; path: string[]; value?: unknown }>): Promise<void> => {
     if (busy || !snap.writable) return
@@ -1543,6 +1640,43 @@ function VoiceConfigPage({
         </span>
       </label>
 
+      <div className="dshv-cfg-row">
+        <span className="dshv-cfg-name">麦克风自检</span>
+        <div className="dshv-cfg-control">
+          <button
+            type="button"
+            className="dshv-cfg-check"
+            disabled={checking}
+            onClick={() => {
+              setChecking(true)
+              setChecks(null)
+              void runMicDiagnostics()
+                .then(setChecks)
+                .catch((e: unknown) => setChecks([{ label: '自检失败', ok: false, detail: errorDetail(e) }]))
+                .finally(() => setChecking(false))
+            }}
+          >
+            {checking ? '检测中…' : '运行自检'}
+          </button>
+          {checks !== null && (
+            <ul className="dshv-cfg-checks">
+              {checks.map((c) => (
+                <li key={c.label} data-ok={c.ok ? 'true' : 'false'}>
+                  <span>{c.ok ? '✓' : '✗'}</span>
+                  <strong>{c.label}</strong>
+                  <em>{c.detail}</em>
+                </li>
+              ))}
+            </ul>
+          )}
+          {checks === null && (
+            <span className="dshv-cfg-sub">
+              长按麦克风提示"不可用"时跑一次：逐项检查安全上下文、权限、设备、音频上下文与 Host 连接，失败项会带错误名。
+            </span>
+          )}
+        </div>
+      </div>
+
       {error && (
         <p className="dshv-cfg-error" role="alert">
           {error}
@@ -1601,6 +1735,20 @@ const CONFIG_CSS = `
 .dshv-cfg-choice strong { font-size:13px; font-weight:600; color:var(--dsw-alias-label-primary,inherit); }
 .dshv-cfg-choice em { font-style:normal; font-size:12px; color:var(--dsw-alias-label-tertiary,inherit); }
 .dshv-cfg-error { margin:0; font-size:12.5px; color:var(--dsw-alias-state-error-primary,#f85149); }
+.dshv-cfg-check {
+  align-self:flex-start; height:28px; padding:0 12px; font:inherit; font-size:12.5px; cursor:pointer;
+  color:var(--dsw-alias-label-primary,inherit); background:var(--dsw-alias-bg-layer-3,transparent);
+  border:.5px solid var(--dsw-alias-border-l4,rgba(128,128,128,.4)); border-radius:8px;
+}
+.dshv-cfg-check:hover:not(:disabled) { border-color:var(--dsw-alias-state-business-primary,#4f46e5); }
+.dshv-cfg-check:disabled { opacity:.6; cursor:default; }
+.dshv-cfg-checks { margin:8px 0 0; padding:0; list-style:none; display:flex; flex-direction:column; gap:6px; }
+.dshv-cfg-checks li { display:flex; gap:8px; align-items:flex-start; font-size:12.5px; line-height:1.5; }
+.dshv-cfg-checks li span { flex:none; width:12px; }
+.dshv-cfg-checks li[data-ok=true] span { color:var(--dsw-alias-state-success-primary,#2ea043); }
+.dshv-cfg-checks li[data-ok=false] span { color:var(--dsw-alias-state-error-primary,#f85149); }
+.dshv-cfg-checks strong { flex:none; min-width:96px; font-weight:500; color:var(--dsw-alias-label-secondary,inherit); }
+.dshv-cfg-checks em { font-style:normal; color:var(--dsw-alias-label-tertiary,inherit); overflow-wrap:anywhere; }
 `
 
 // The page registers its own style block on first render.
