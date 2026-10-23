@@ -710,7 +710,8 @@ describe('VoiceSettingsPage', () => {
     render(<VoiceSettingsPage formService={service} />)
     expect(screen.getByText('语音对话')).toBeTruthy()
     expect(screen.getByRole('checkbox')).toBeTruthy()
-    expect(screen.getByRole('slider')).toBeTruthy()
+    // two sliders: silence window and speech-trigger threshold
+    expect(screen.getAllByRole('slider')).toHaveLength(2)
     expect(screen.getByText('只播首句')).toBeTruthy()
     expect(screen.getByText('整篇朗读')).toBeTruthy()
     expect(screen.getByText('静音')).toBeTruthy()
@@ -724,6 +725,20 @@ describe('VoiceSettingsPage', () => {
     })
     expect(service.mutate).toHaveBeenCalledWith([
       { op: 'set', path: ['asr', 'autoSend'], value: false },
+    ])
+  })
+
+  it('writes the speech-trigger threshold through the form service', async () => {
+    const service = fakeFormService()
+    render(<VoiceSettingsPage formService={service} />)
+    const sliders = screen.getAllByRole('slider')
+    const threshold = sliders[1] as HTMLInputElement
+    await act(async () => {
+      fireEvent.change(threshold, { target: { value: '0.03' } })
+      fireEvent.blur(threshold)
+    })
+    expect(service.mutate).toHaveBeenCalledWith([
+      { op: 'set', path: ['asr', 'energyThreshold'], value: 0.03 },
     ])
   })
 

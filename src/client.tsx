@@ -61,7 +61,8 @@ function apiUrl(path: string): string {
 }
 
 /** Load (and cache) the host config; the base path comes from it. */
-function loadConfig(): Promise<HostConfig> {
+function loadConfig(force = false): Promise<HostConfig> {
+  if (force) configPromise = null
   if (configPromise === null) {
     configPromise = fetch(`${BOOTSTRAP_BASE}/config`)
       .then((r) => {
@@ -1029,6 +1030,22 @@ export function MicButton({ useSession, useInput, inputActions, skipPlayback, ca
     return () => clearTimeout(t)
   }, [error])
 
+  /**
+   * Re-read the host config before each recording so sensitivity and the
+   * silence window edited in Settings apply without a page refresh.
+   */
+  const refreshAsrConfig = async (): Promise<void> => {
+    const engine = engineRef.current
+    if (!engine) return
+    try {
+      const c = await loadConfig(true)
+      configRef.current = c.asr
+      engine.setAsrConfig(c.asr)
+    } catch {
+      // keep the last known config; the recording path still works
+    }
+  }
+
   const toggle = async (): Promise<void> => {
     const engine = engineRef.current
     if (!engine) return
@@ -1041,6 +1058,7 @@ export function MicButton({ useSession, useInput, inputActions, skipPlayback, ca
     setError(null)
     try {
       if (engine.state === 'idle') {
+        void refreshAsrConfig()
         await engine.start()
       } else {
         await engine.stop()
@@ -1164,6 +1182,7 @@ export function MicButton({ useSession, useInput, inputActions, skipPlayback, ca
         const r = target.getBoundingClientRect()
         setSendRect({ left: r.left, top: r.top, width: r.width, height: r.height })
       }
+      void refreshAsrConfig()
       void engineRef.current?.start({ hold: true }).catch((err: unknown) => {
         // Most failures here are getUserMedia denials. Silently closing the
         // overlay looks like "press-to-talk does nothing", so surface the
@@ -1523,6 +1542,10 @@ function VoiceConfigPage({
   const shownSilence = silenceText ?? String(silenceMs)
   const [checks, setChecks] = useState<MicCheck[] | null>(null)
   const [checking, setChecking] = useState(false)
+  const energyThreshold =
+    typeof asr['energyThreshold'] === 'number' ? (asr['energyThreshold'] as number) : 0.015
+  const [thresholdText, setThresholdText] = useState<string | null>(null)
+  const shownThreshold = thresholdText ?? energyThreshold.toFixed(3)
 
   const write = async (ops: Array<{ op: string; path: string[]; value?: unknown }>): Promise<void> => {
     if (busy || !snap.writable) return
@@ -1590,6 +1613,38 @@ function VoiceConfigPage({
             }}
           />
           <span className="dshv-cfg-sub">{shownSilence} ms（越小发送越快，越大越能容忍思考停顿）</span>
+        </span>
+      </label>
+
+      <label className="dshv-cfg-row">
+        <span className="dshv-cfg-name">语音触发阈值</span>
+        <span className="dshv-cfg-control">
+          <input
+            type="range"
+            min={0.004}
+            max={0.06}
+            step={0.001}
+            value={shownThreshold}
+            disabled={busy || !snap.writable}
+            onChange={(e) => setThresholdText(e.target.value)}
+            onBlur={() => {
+              const n = Number(shownThreshold)
+              setThresholdText(null)
+              if (Number.isFinite(n) && Math.abs(n - energyThreshold) > 1e-9) {
+                void write([{ op: 'set', path: ['asr', 'energyThreshold'], value: n }])
+              }
+            }}
+          />
+          <span className="dshv-cfg-sub">
+            {shownThreshold}
+            {' · '}
+            {shownThreshold >= '0.030'
+              ? '较迟钝：只对较大的声音响应'
+              : shownThreshold >= '0.015'
+                ? '标准：默认灵敏度'
+                : '较灵敏：轻声也会触发'}
+            （越大越抗噪，越小越灵敏）
+          </span>
         </span>
       </label>
 

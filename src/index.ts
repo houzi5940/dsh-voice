@@ -65,6 +65,12 @@ export interface AsrRuntimeConfig {
    * Hold it to record, release to send, Escape to discard. Empty disables it.
    */
   hotkey: string
+  /**
+   * RMS energy that counts as speech (0–1). Raise it when background noise or
+   * speaker echo keeps triggering the recorder; lower it for quiet mics.
+   * Default 0.015.
+   */
+  energyThreshold: number
 }
 
 export interface TtsRuntimeConfig {
@@ -117,6 +123,7 @@ export const Config: z<Config> = z.object({
       autoSend: z.boolean().default(false).volatile(),
       mode: z.union([z.const('toggle'), z.const('hold')]).default('toggle'),
       hotkey: z.string().default('Control').volatile(),
+      energyThreshold: z.number().min(0.002).max(0.2).default(0.015).volatile(),
       /** Silence (ms) that ends a tap-mode segment; lower = snappier sends. */
       silenceMs: z.number().min(200).max(10_000).default(2000).volatile(),
     })

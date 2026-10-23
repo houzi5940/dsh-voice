@@ -13,6 +13,11 @@ export interface AsrConfig {
   /** Auto-submit the draft after a transcript lands. */
   autoSend: boolean
   /**
+   * RMS energy that counts as speech. Higher = less sensitive (ignores
+   * background noise and speaker echo); lower = picks up quiet speech.
+   */
+  energyThreshold?: number
+  /**
    * Silence (ms) that ends a tap-mode segment. Shorter = snappier
    * turn-taking but may cut deliberate pauses; 2000 is the upstream default.
    */
@@ -102,7 +107,9 @@ export function createAsrEngine(
   const partialListeners = new Set<(text: string) => void>()
   // Per-instance silence threshold so the host config can tune turn-taking
   // without redeploying the client. Falls back to the upstream default.
-  const silenceTimeoutMs = config.silenceMs ?? SILENCE_TIMEOUT_MS
+  let silenceTimeoutMs = config.silenceMs ?? SILENCE_TIMEOUT_MS
+  /** Speech-detection threshold; live-tunable through setAsrConfig(). */
+  let energyThreshold = config.energyThreshold ?? ENERGY_THRESHOLD
   // SenseVoice runs host-side (sherpa-onnx); the browser just POSTs raw
   // f32 PCM and reads the transcript back.
   const asrUrl = `${location.origin}${basePath.replace(/\/+$/, '')}/asr`
@@ -354,7 +361,7 @@ export function createAsrEngine(
     // Press-to-talk records the whole press: keep every buffer and let the
     // release define the endpoint. Only the barge-in edge still needs the VAD.
     if (holdMode) {
-      if (!speechActive && rms > ENERGY_THRESHOLD) {
+      if (!speechActive && rms > energyThreshold) {
         speechActive = true
         setState('speech')
         for (const fn of speechStartListeners) {
@@ -381,7 +388,7 @@ export function createAsrEngine(
       return
     }
 
-    if (rms > ENERGY_THRESHOLD) {
+    if (rms > energyThreshold) {
       if (!speechActive) {
         speechActive = true
         setState('speech')
@@ -639,6 +646,10 @@ export function createAsrEngine(
     setTranscriptHandler(fn) {
       transcriptListeners.clear()
       transcriptListeners.add(fn)
+    },
+    setAsrConfig(next) {
+      if (typeof next.silenceMs === 'number') silenceTimeoutMs = next.silenceMs
+      if (typeof next.energyThreshold === 'number') energyThreshold = next.energyThreshold
     },
   }
 }

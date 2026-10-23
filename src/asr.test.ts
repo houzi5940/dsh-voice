@@ -440,3 +440,36 @@ describe('echo reference across AudioContexts', () => {
     expect(connect).toHaveBeenCalled()
   })
 })
+
+// Speech-trigger threshold: the one knob for "too sensitive". A high value
+// ignores quiet speech; setAsrConfig lowers it live, no engine rebuild.
+describe('speech-trigger threshold', () => {
+  it('ignores quiet speech when the threshold is high', async () => {
+    const audio = installFakeAudio()
+    const posts = installFetchCapture('不该出现')
+    const engine = createAsrEngine({ mode: 'toggle', autoSend: false, energyThreshold: 0.05 }, '/dsh-voice-api')
+
+    await engine.start()
+    for (let i = 0; i < 40; i++) audio.tick(0.02) // audible but below 0.05
+    await engine.stop()
+    await settle()
+
+    expect(posts).toHaveLength(0)
+  })
+
+  it('applies a lowered threshold live through setAsrConfig', async () => {
+    const audio = installFakeAudio()
+    const posts = installFetchCapture('现在能听到了')
+    const engine = createAsrEngine({ mode: 'toggle', autoSend: false, energyThreshold: 0.05 }, '/dsh-voice-api')
+
+    await engine.start()
+    for (let i = 0; i < 10; i++) audio.tick(0.02)
+    // Settings write while recording: the next buffers use the new value.
+    engine.setAsrConfig({ mode: 'toggle', autoSend: false, energyThreshold: 0.01 })
+    for (let i = 0; i < 40; i++) audio.tick(0.02)
+    await engine.stop()
+    await settle()
+
+    expect(posts).toHaveLength(1)
+  })
+})
