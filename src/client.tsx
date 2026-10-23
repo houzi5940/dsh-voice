@@ -619,12 +619,17 @@ const UI_CSS = `
 }
 `
 
-let styleInjected = false
+const injectedStyles = new Set<string>()
 
+/**
+ * Inject a CSS block once, keyed by its text: several components (voice
+ * panel, replay action) each inject their own stylesheet, so one shared
+ * "already injected" flag would silently drop every sheet after the first.
+ */
 function useStyle(css: string): void {
   useEffect(() => {
-    if (styleInjected) return
-    styleInjected = true
+    if (injectedStyles.has(css)) return
+    injectedStyles.add(css)
     const el = document.createElement('style')
     el.textContent = css
     document.head.appendChild(el)
