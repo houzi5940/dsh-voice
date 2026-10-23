@@ -55,10 +55,23 @@ export class TtsQueue {
   private readonly voice: string
   private readonly prosody?: ProsodyOptions
   private ready: Promise<void> | null = null
+  /**
+   * Called when the last session queue drains. The msedge-tts WebSocket
+   * holds the Node event loop open even when idle, so the host closes the
+   * connection between turns (the next enqueue lazily reopens it); tests
+   * otherwise hang after the final sentence. Never throws: a failed close
+   * must not take the pump down with it.
+   */
+  private onDrained: (() => void) | null = null
 
-  constructor(options: { voice?: string; prosody?: ProsodyOptions } = {}) {
+  constructor(options: {
+    voice?: string
+    prosody?: ProsodyOptions
+    onDrained?: () => void
+  } = {}) {
     this.voice = options.voice ?? 'zh-CN-XiaoxiaoNeural'
     this.prosody = options.prosody
+    this.onDrained = options.onDrained ?? null
   }
 
   /** Initialize the Edge TTS WebSocket once (lazy, re-runnable after close). */
@@ -198,11 +211,27 @@ export class TtsQueue {
       this.scheduleRetry(sessionId, q)
     } finally {
       q.busy = false
+      // An empty queue keeps no session state around. When it was the last
+      // one, close the idle TTS websocket (it holds the event loop open).
+      // A retry in flight keeps its queue; the backoff path re-pumps it.
+      if (q.pending.length === 0 && q.retry === null) {
+        this.queues.delete(sessionId)
+        if (this.queues.size === 0 && this.onDrained) {
+          const cb = this.onDrained
+          this.onDrained = null
+          try {
+            cb()
+          } catch {
+            // closing must never break the pump
+          }
+        }
+      }
     }
   }
 
   async close(): Promise<void> {
     for (const q of this.queues.values()) this.clearRetry(q)
+    this.onDrained = null
     await this.tts.close()
     this.ready = null
   }

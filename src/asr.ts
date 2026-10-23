@@ -12,6 +12,11 @@ export interface AsrConfig {
   mode: 'toggle' | 'hold'
   /** Auto-submit the draft after a transcript lands. */
   autoSend: boolean
+  /**
+   * Silence (ms) that ends a tap-mode segment. Shorter = snappier
+   * turn-taking but may cut deliberate pauses; 2000 is the upstream default.
+   */
+  silenceMs?: number
 }
 
 export interface AsrEngine {
@@ -91,6 +96,9 @@ export function createAsrEngine(
   const speechStartListeners = new Set<() => void>()
   const levelListeners = new Set<(level: number) => void>()
   const partialListeners = new Set<(text: string) => void>()
+  // Per-instance silence threshold so the host config can tune turn-taking
+  // without redeploying the client. Falls back to the upstream default.
+  const silenceTimeoutMs = config.silenceMs ?? SILENCE_TIMEOUT_MS
   // SenseVoice runs host-side (sherpa-onnx); the browser just POSTs raw
   // f32 PCM and reads the transcript back.
   const asrUrl = `${location.origin}${basePath.replace(/\/+$/, '')}/asr`
@@ -373,7 +381,7 @@ export function createAsrEngine(
       segmentMs += durationMs
       silenceMs += durationMs
       segment.push(data)
-      if (silenceMs > SILENCE_TIMEOUT_MS) flushWithPad()
+      if (silenceMs > silenceTimeoutMs) flushWithPad()
     } else {
       prePad.push(data)
       const keepMs = PRE_PAD_MS

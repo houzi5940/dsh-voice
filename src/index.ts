@@ -67,12 +67,26 @@ export interface AsrRuntimeConfig {
   hotkey: string
 }
 
+export interface TtsRuntimeConfig {
+  /**
+   * Which sentences reach the synthesizer. The transcript is always complete
+   * in the session; this only trims what is spoken aloud.
+   *
+   * - 'first': speak only the first sentence of each turn (brief spoken
+   *   reply, full text stays in the conversation).
+   * - 'all': speak every sentence (upstream behavior).
+   * - 'off': never synthesize; TTS is effectively muted.
+   */
+  mode: 'first' | 'all' | 'off'
+}
+
 export interface Config {
   basePath: string
   voice: string
   enabled: boolean
   cacheDir: string
   asr: AsrRuntimeConfig
+  tts: TtsRuntimeConfig
 }
 
 export const Config: z<Config> = z.object({
@@ -91,6 +105,13 @@ export const Config: z<Config> = z.object({
       autoSend: z.boolean().default(false),
       mode: z.union([z.const('toggle'), z.const('hold')]).default('toggle'),
       hotkey: z.string().default('Control'),
+      /** Silence (ms) that ends a tap-mode segment; lower = snappier sends. */
+      silenceMs: z.number().min(200).max(10_000).default(2000),
+    })
+    .default({}),
+  tts: z
+    .object({
+      mode: z.union([z.const('first'), z.const('all'), z.const('off')]).default('all'),
     })
     .default({}),
 })
@@ -100,7 +121,18 @@ export function apply(ctx: Context, config: Config): void {
 
   // --- SSE fan-out: every client connection receives every voice frame. ---
   const clients = new Set<(frame: VoiceFrame) => void>()
-  const queue = new TtsQueue({ voice: config.voice })
+  // onDrained closes the idle Edge-TTS websocket once every session queue
+  // has emptied: the socket pins the Node event loop open, and without this
+  // a quiet host keeps a live TLS connection forever (and plain-node tests
+  // hang after the last sentence). The next enqueue lazily reconnects, so
+  // latency cost is one handshake at the start of each spoken turn.
+  let drained: Promise<void> | null = null
+  const queue = new TtsQueue({
+    voice: config.voice,
+    onDrained: () => {
+      drained = queue.close().catch(() => {})
+    },
+  })
   const unsubscribe = queue.subscribe((frame) => {
     for (const send of clients) {
       try {
@@ -114,10 +146,12 @@ export function apply(ctx: Context, config: Config): void {
 
   // --- llm/stream lossless tap: segment and enqueue, never block the model. ---
   const sessionSegmenters = new Map<string, SentenceSegmenter>()
+  // Older configs may predate tts.mode; default to speaking everything.
+  const ttsMode = config.tts?.mode ?? 'all'
   ctx.on('llm/stream', (options: GenerateOptions, next): AsyncIterable<StreamChunk> => {
     const sessionId = options.sessionId
     if (!config.enabled || sessionId === undefined) return next()
-    return tapStream(sessionId, next(), queue, sessionSegmenters)
+    return tapStream(sessionId, next(), queue, sessionSegmenters, ttsMode)
   })
 
   // --- HTTP surface: SSE stream, cancel, and the wiring ping. ---
@@ -139,6 +173,8 @@ export function apply(ctx: Context, config: Config): void {
         const heartbeat = setInterval(() => {
           res.write(': hb\n')
         }, 25000)
+        // A test stub response keeps the process alive for 25s otherwise.
+        heartbeat.unref?.()
         const cleanup = (): void => {
           clearInterval(heartbeat)
           clients.delete(send)
@@ -508,26 +544,54 @@ function serveLocal(
   createReadStream(filePath).pipe(res)
 }
 
+/**
+ * Decide which segmented sentences are worth synthesizing.
+ *
+ * 'first' speaks only the opening sentence of the turn — the transcript stays
+ * complete because the tap passes every chunk through untouched; only the
+ * spoken half is trimmed. 'off' mutes synthesis entirely (segmentation still
+ * runs so behavior is identical otherwise). 'all' keeps upstream behavior.
+ */
+function speakable(
+  sentences: string[],
+  spokenThisTurn: () => boolean,
+  mode: 'first' | 'all' | 'off',
+): string[] {
+  if (mode === 'off') return []
+  if (mode !== 'first') return sentences
+  if (spokenThisTurn() || sentences.length === 0) return []
+  return [sentences[0]]
+}
+
 async function* tapStream(
   sessionId: string,
   inner: AsyncIterable<StreamChunk>,
   queue: TtsQueue,
   sessionSegmenters: Map<string, SentenceSegmenter>,
+  ttsMode: 'first' | 'all' | 'off',
 ): AsyncIterable<StreamChunk> {
   const segmenter = new SentenceSegmenter()
   sessionSegmenters.set(sessionId, segmenter)
   let flushed = false
   let completed = false
   let finishReason: unknown = null
+  let spoke = false
+  const spokeAlready = (): boolean => spoke
   const flushOnce = (): void => {
     if (flushed) return
     flushed = true
-    for (const s of segmenter.flush()) queue.enqueue(sessionId, s)
+    for (const s of speakable(segmenter.flush(), spokeAlready, ttsMode)) {
+      spoke = true
+      queue.enqueue(sessionId, s)
+    }
   }
   try {
     for await (const chunk of inner) {
       if (chunk.type === 'text-delta' && chunk.text) {
-        for (const s of segmenter.feed(chunk.text)) queue.enqueue(sessionId, s)
+        for (const s of speakable(segmenter.feed(chunk.text), spokeAlready, ttsMode)) {
+          spoke = true
+          queue.enqueue(sessionId, s)
+        }
       }
       if (chunk.type === 'finish') finishReason = chunk.reason
       yield chunk
