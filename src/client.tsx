@@ -104,6 +104,15 @@ export const inject = ['slots', 'sessions']
 const PKG_NAME = '@haoku123/dsh-voice'
 const SETTINGS_NS = 'voice'
 
+/** The Settings nav label follows the browser language; no locale service needed. */
+function isZhUi(): boolean {
+  try {
+    return String(navigator.language || '').toLowerCase().startsWith('zh')
+  } catch {
+    return false
+  }
+}
+
 export function apply(ctx: any): void {
   // --- audio playback engine lives in the apply closure (object layer) ---
   const engine = createAudioEngine()
@@ -125,6 +134,22 @@ export function apply(ctx: any): void {
             ownerProps.view === 'summary' ? null : (
               <VoiceConfigPage formService={formsCtx.configForms} />
             ),
+        ),
+      )
+
+      // A page in the Settings panel's left navigation, so the voice
+      // preferences are reachable without going through the plugin page.
+      // order 37 sits between "Our Free Model" (35) and the plugin market
+      // (40); an unknown section id gets the shell's default gear icon.
+      formsCtx.slots.inject('settings.section', () =>
+        formsCtx.slots.register(
+          {
+            name: 'settings.section',
+            id: 'voice',
+            order: 37,
+            label: () => (isZhUi() ? '语音对话' : 'Voice'),
+          },
+          () => <VoiceSettingsPage formService={formsCtx.configForms} />,
         ),
       )
     })
@@ -1354,7 +1379,13 @@ function asNested(value: unknown, key: string, fallback: Record<string, unknown>
   return fallback
 }
 
-function VoiceConfigPage({ formService }: { formService: any }): React.ReactElement {
+function VoiceConfigPage({
+  formService,
+  showTitle = true,
+}: {
+  formService: any
+  showTitle?: boolean
+}): React.ReactElement {
   useConfigStyle()
   // ns = the loader entry id; the Settings service keys forms that way.
   const form = formService.get(SETTINGS_NS)
@@ -1405,7 +1436,7 @@ function VoiceConfigPage({ formService }: { formService: any }): React.ReactElem
 
   return (
     <section className="dshv-cfg" aria-busy={busy}>
-      <h3 className="dshv-cfg-title">语音对话</h3>
+      {showTitle && <h3 className="dshv-cfg-title">语音对话</h3>}
       <p className="dshv-cfg-hint">
         修改立即生效：保存会写入当前 profile 的插件配置并热更新，无需重启。点按麦克风开启连续听写；说话{' '}
         {shownSilence}ms 静音即自动发送；朗读时开口即可打断。
@@ -1525,7 +1556,28 @@ function VoiceConfigPage({ formService }: { formService: any }): React.ReactElem
   )
 }
 
+/**
+ * The Settings-panel page (`settings.section` id 'voice'): a section heading
+ * plus the same live form the bundle page renders. The panel content column
+ * supplies horizontal padding; the heading matches the other sections.
+ */
+function VoiceSettingsPage({ formService }: { formService: any }): React.ReactElement {
+  useConfigStyle()
+  return (
+    <section className="dshv-cfg-page">
+      <h2 className="dshv-cfg-page-title">语音对话</h2>
+      <p className="dshv-cfg-page-intro">
+        麦克风连续听写、停顿自动发送、语音打断与朗读策略。修改立即生效，无需重启。
+      </p>
+      <VoiceConfigPage formService={formService} showTitle={false} />
+    </section>
+  )
+}
+
 const CONFIG_CSS = `
+.dshv-cfg-page { display:flex; flex-direction:column; gap:10px; padding-top:8px; }
+.dshv-cfg-page-title { margin:0; font-size:18px; font-weight:600; color:var(--dsw-alias-label-primary,inherit); }
+.dshv-cfg-page-intro { margin:0 0 8px; font-size:13px; line-height:1.6; color:var(--dsw-alias-label-secondary,inherit); }
 .dshv-cfg { display:flex; flex-direction:column; gap:18px; font-family:var(--ds-font-family,-apple-system,system-ui,sans-serif); }
 .dshv-cfg-title { margin:0; font-size:15px; font-weight:600; color:var(--dsw-alias-label-primary,inherit); }
 .dshv-cfg-hint { margin:0; font-size:12.5px; line-height:1.6; color:var(--dsw-alias-label-tertiary,inherit); }
