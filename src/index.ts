@@ -626,9 +626,16 @@ export function apply(ctx: Context, config: Config): void {
               res.end(JSON.stringify({ error: 'session not found' }))
               return
             }
-            const message = session
-              .deriveMessages()
-              .find((m) => m.id === body.messageId)
+            let message: { content?: unknown; blocks?: unknown } | undefined
+            try {
+              message = session
+                .deriveMessages()
+                .find((m) => m.id === body.messageId)
+            } catch (error) {
+              res.statusCode = 500
+              res.end(JSON.stringify({ error: String(error) }))
+              return
+            }
             const raw = message?.content ?? message?.blocks
             const full = Array.isArray(raw)
               ? raw
