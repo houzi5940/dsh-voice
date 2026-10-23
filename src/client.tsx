@@ -1561,7 +1561,7 @@ function VoiceConfigPage({
  * plus the same live form the bundle page renders. The panel content column
  * supplies horizontal padding; the heading matches the other sections.
  */
-function VoiceSettingsPage({ formService }: { formService: any }): React.ReactElement {
+export function VoiceSettingsPage({ formService }: { formService: any }): React.ReactElement {
   useConfigStyle()
   return (
     <section className="dshv-cfg-page">

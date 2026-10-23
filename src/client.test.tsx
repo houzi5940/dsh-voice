@@ -65,7 +65,7 @@ vi.mock('./asr.ts', () => ({
   },
 }))
 
-const { VoicePanel, MicButton, __resetVoiceConfigCache } = await import('./client.tsx')
+const { VoicePanel, MicButton, VoiceSettingsPage, __resetVoiceConfigCache } = await import('./client.tsx')
 
 /** Fake audio engine: `push` drives the panel through subscribe(). */
 function fakeAudioEngine(): VoicePanelActions & {
@@ -666,5 +666,83 @@ describe('keyboard press-to-talk', () => {
     await mounted()
     await holdKey()
     expect(engineHandles.current!.start).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Settings-page form: renders from the settings snapshot and writes through
+// the shared form service (never through a private fetch).
+// ---------------------------------------------------------------------------
+
+function fakeFormService(overrides: Partial<Record<string, unknown>> = {}) {
+  const listeners = new Set<() => void>()
+  const mutate = vi.fn(async () => true)
+  const snapshot = {
+    status: 'ready',
+    writable: true,
+    revision: 1,
+    value: {
+      voice: 'zh-CN-XiaoxiaoNeural',
+      enabled: true,
+      asr: { autoSend: true, hotkey: 'Control', silenceMs: 1000 },
+      tts: { mode: 'first' },
+      ...overrides,
+    },
+  }
+  return {
+    describe: () => ({ getSnapshot: () => ({ view: undefined }) }),
+    get: () => ({
+      getSnapshot: () => snapshot,
+      subscribe: (fn: () => void) => {
+        listeners.add(fn)
+        return () => listeners.delete(fn)
+      },
+      mutate,
+    }),
+    mutate,
+    snapshot,
+  }
+}
+
+describe('VoiceSettingsPage', () => {
+  it('renders the heading, current values and all controls', () => {
+    const service = fakeFormService()
+    render(<VoiceSettingsPage formService={service} />)
+    expect(screen.getByText('语音对话')).toBeTruthy()
+    expect(screen.getByRole('checkbox')).toBeTruthy()
+    expect(screen.getByRole('slider')).toBeTruthy()
+    expect(screen.getByText('只播首句')).toBeTruthy()
+    expect(screen.getByText('整篇朗读')).toBeTruthy()
+    expect(screen.getByText('静音')).toBeTruthy()
+  })
+
+  it('writes the auto-send toggle through the form service', async () => {
+    const service = fakeFormService()
+    render(<VoiceSettingsPage formService={service} />)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('checkbox'))
+    })
+    expect(service.mutate).toHaveBeenCalledWith([
+      { op: 'set', path: ['asr', 'autoSend'], value: false },
+    ])
+  })
+
+  it('writes the tts mode radio through the form service', async () => {
+    const service = fakeFormService()
+    render(<VoiceSettingsPage formService={service} />)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('radio', { name: /整篇朗读/ }))
+    })
+    expect(service.mutate).toHaveBeenCalledWith([
+      { op: 'set', path: ['tts', 'mode'], value: 'all' },
+    ])
+  })
+
+  it('shows the loading state until the settings snapshot arrives', () => {
+    const service = fakeFormService()
+    service.snapshot.status = 'loading'
+    service.snapshot.value = undefined as never
+    render(<VoiceSettingsPage formService={service} />)
+    expect(screen.getByText('正在读取语音配置…')).toBeTruthy()
   })
 })
