@@ -18,7 +18,7 @@
   "scripts": {
     "build": "node build.mjs",
     "test": "npm run test:host && npm run test:client",
-    "test:host": "node test/segmenter.test.mjs && node test/tts-retry.test.mjs && node test/bargein.test.mjs && node test/bargein-semantics.test.mjs && node test/host.integration.test.mjs && node test/tts-mode.test.mjs",
+    "test:host": "node test/segmenter.test.mjs && node test/tts-retry.test.mjs && node test/bargein.test.mjs && node test/bargein-semantics.test.mjs && node test/host.integration.test.mjs && node test/tts-mode.test.mjs && node test/replay.test.mjs",
     "test:client": "vitest run",
     "prefetch": "node scripts/prefetch.mjs"
   },

@@ -27,6 +27,8 @@ export interface VoicePanelActions {
   connect(): void
   disconnect(): void
   skip(): void
+  /** Play one synthesized MP3 (message replay) on the shared TTS element. */
+  replay(url: string): void
   subscribe(fn: (s: AudioState) => void): () => void
 }
 
@@ -155,6 +157,20 @@ export function apply(ctx: any): void {
       )
     })
   }
+
+  // Speaker button on every finalized assistant message: replays that
+  // message through the host synthesizer, honouring tts.mode.
+  ctx.slots.inject('conversation.chat.assistant-actions', () =>
+    ctx.slots.register(
+      {
+        name: 'conversation.chat.assistant-actions',
+        id: 'voice-replay',
+        order: 15,
+        inject: () => ({ replay: engine.replay }),
+      },
+      ReplayAction,
+    ),
+  )
 
   ctx.slots.inject('shell.overlay', () =>
     ctx.slots.register(
@@ -325,6 +341,29 @@ function createAudioEngine(): VoicePanelActions {
     setState({ playing: false, caption: null })
   }
 
+  const replay = (url: string): void => {
+    // Replay shares the TTS element, so barge-in (skip) and the echo
+    // reference keep working; the SSE queue is dropped, not paused.
+    queue.length = 0
+    audio.pause()
+    audio.onended = null
+    audio.onerror = null
+    ensureAudioCtx()
+    audio.src = url
+    audio.onended = () => {
+      URL.revokeObjectURL(url)
+      setState({ playing: false, caption: null })
+    }
+    audio.onerror = () => {
+      URL.revokeObjectURL(url)
+      setState({ playing: false })
+    }
+    setState({ playing: true, caption: null })
+    void audio.play().catch(() => {
+      setState({ playing: false })
+    })
+  }
+
   const subscribe = (fn: (s: AudioState) => void): (() => void) => {
     listeners.add(fn)
     fn(state)
@@ -333,7 +372,7 @@ function createAudioEngine(): VoicePanelActions {
     }
   }
 
-  return { connect, disconnect, skip, subscribe }
+  return { connect, disconnect, skip, replay, subscribe }
 }
 
 export function VoicePanel(props: VoicePanelActions): React.ReactElement {
@@ -1800,6 +1839,112 @@ export function VoiceSettingsPage({ formService }: { formService: any }): React.
     </section>
   )
 }
+
+/**
+ * Speaker button in the assistant action row. The host resolves the message
+ * text from the session and synthesizes it with the current tts.mode, so the
+ * replay matches what the live turn would have spoken.
+ */
+function ReplayAction({
+  messageId,
+  sessionId,
+  replay,
+}: {
+  messageId: string
+  sessionId?: string
+  replay: (url: string) => void
+}): React.ReactElement {
+  useStyle(REPLAY_CSS)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const click = async (): Promise<void> => {
+    if (busy || sessionId === undefined) return
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await fetch(apiUrl('/replay'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, messageId }),
+      })
+      if (res.status === 204) {
+        setError('这条消息没有可朗读的内容')
+        return
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      replay(URL.createObjectURL(blob))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        className="dshv-replay"
+        aria-label={busy ? '正在合成…' : '朗读这条回复'}
+        title={error ?? '朗读这条回复'}
+        onClick={() => void click()}
+        disabled={busy}
+      >
+        {busy ? (
+          <span className="dshv-replay-spin" />
+        ) : (
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M8.5 2.6 5 5.2H2.9a.9.9 0 0 0-.9.9v3.8a.9.9 0 0 0 .9.9H5l3.5 2.6a.6.6 0 0 0 .95-.49V3.09a.6.6 0 0 0-.95-.49Z"
+              fill="currentColor"
+            />
+            <path
+              d="M11.2 5.4a3.4 3.4 0 0 1 0 5.2M12.9 3.6a5.8 5.8 0 0 1 0 8.8"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.2"
+              strokeLinecap="round"
+            />
+          </svg>
+        )}
+      </button>
+      {error !== null && (
+        <span className="dshv-replay-error" role="status">
+          {error}
+        </span>
+      )}
+    </>
+  )
+}
+
+const REPLAY_CSS = `
+.dshv-replay {
+  width: calc(28px + var(--dsh-content-font-delta, 0px));
+  height: calc(28px + var(--dsh-content-font-delta, 0px));
+  border-radius: var(--dsw-radius-sm, 6px);
+  color: var(--dsw-alias-label-tertiary, #8b949e);
+  background: none; border: none; padding: 6px; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  vertical-align: middle;
+}
+.dshv-replay:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(139, 148, 158, 0.14));
+  color: var(--dsw-alias-label-secondary, #b0b6bd);
+}
+.dshv-replay:disabled { opacity: .6; cursor: default; }
+.dshv-replay-spin {
+  width: 12px; height: 12px; border-radius: 999px;
+  border: 2px solid currentColor; border-top-color: transparent;
+  animation: dshv-spin-replay 0.7s linear infinite;
+}
+@keyframes dshv-spin-replay { to { transform: rotate(360deg) } }
+.dshv-replay-error {
+  font-size: 11px; color: var(--dsw-alias-state-error-primary, #f85149);
+  align-self: center; margin-left: 2px;
+}
+`
 
 const CONFIG_CSS = `
 .dshv-cfg-page { display:flex; flex-direction:column; gap:10px; padding-top:8px; }

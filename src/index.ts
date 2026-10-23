@@ -29,6 +29,7 @@ const { createOfflineRecognizer } = sherpa_onnx as unknown as {
 }
 
 import { ParagraphGate, SentenceSegmenter } from './segmenter.ts'
+import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts'
 import { TtsQueue, type VoiceFrame } from './tts-queue.ts'
 
 /**
@@ -168,6 +169,45 @@ function resolveVolatile(node: unknown): unknown {
     out[key] = resolveVolatile(value)
   }
   return out
+}
+
+/**
+ * The slice of a finished answer that the current tts.mode would have spoken.
+ * Replay uses the same policy, so pressing the speaker on a message sounds
+ * exactly like the live turn did.
+ */
+function spokenSlice(full: string, mode: TtsRuntimeConfig['mode']): string {
+  if (mode === 'off' || full.trim() === '') return ''
+  if (mode === 'paragraph') {
+    const gate = new ParagraphGate()
+    return [...gate.feed(full), ...gate.flush()].join('')
+  }
+  const seg = new SentenceSegmenter()
+  const parts = [...seg.feed(full), ...seg.flush()]
+  return mode === 'first' ? (parts[0] ?? '') : parts.join('')
+}
+
+/** Synthesize one string to MP3 with a short-lived Edge TTS connection. */
+async function synthesizeMp3(text: string, voice: string): Promise<Buffer> {
+  const tts = new MsEdgeTTS()
+  try {
+    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3, {
+      wordBoundaryEnabled: false,
+      sentenceBoundaryEnabled: false,
+    })
+    const { audioStream } = await tts.toStream(text)
+    const chunks: Buffer[] = []
+    for await (const chunk of audioStream) chunks.push(chunk as Buffer)
+    return Buffer.concat(chunks)
+  } finally {
+    // close() is synchronous in msedge-tts; never let teardown mask the
+    // synthesis result.
+    try {
+      await Promise.resolve(tts.close())
+    } catch {
+      // ignore
+    }
+  }
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -548,6 +588,74 @@ export function apply(ctx: Context, config: Config): void {
         res.statusCode = 202
         res.setHeader('content-type', 'application/json')
         res.end(JSON.stringify({ model: modelPhase }))
+      },
+    }),
+  )
+
+  // Replay one finished assistant message through the same TTS policy the
+  // live turn used. The text is read from the session store, so the action
+  // does not depend on the Client keeping assistant text around.
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${base}/replay`,
+      handler: (req, res: ServerResponse) => {
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end('POST only')
+          return
+        }
+        const chunks: Buffer[] = []
+        req.on('data', (c: Buffer) => chunks.push(c))
+        req.on('end', () => {
+          void (async () => {
+            let body: { sessionId?: string; messageId?: string } = {}
+            try {
+              body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as typeof body
+            } catch {
+              res.statusCode = 400
+              res.end(JSON.stringify({ error: 'invalid body' }))
+              return
+            }
+            const sessions = ctx.get('sessions') as
+              | { get(id: string): { deriveMessages(): Array<{ id: string; role?: string; content?: unknown; blocks?: unknown }> } | undefined }
+              | undefined
+            const session = body.sessionId ? sessions?.get(body.sessionId) : undefined
+            if (!session) {
+              res.statusCode = 404
+              res.end(JSON.stringify({ error: 'session not found' }))
+              return
+            }
+            const message = session
+              .deriveMessages()
+              .find((m) => m.id === body.messageId)
+            const raw = message?.content ?? message?.blocks
+            const full = Array.isArray(raw)
+              ? raw
+                  .map((block) => {
+                    const b = block as { type?: string; text?: unknown }
+                    return b.type === 'text' && typeof b.text === 'string' ? b.text : ''
+                  })
+                  .join('')
+              : ''
+            const spoken = spokenSlice(full, ttsMode())
+            if (spoken === '') {
+              res.statusCode = 204
+              res.end()
+              return
+            }
+            try {
+              const audio = await synthesizeMp3(spoken, live(config.voice) ?? 'zh-CN-XiaoxiaoNeural')
+              res.statusCode = 200
+              res.setHeader('content-type', 'audio/mpeg')
+              res.setHeader('content-length', String(audio.length))
+              res.end(audio)
+            } catch (error) {
+              res.statusCode = 502
+              res.end(JSON.stringify({ error: String(error) }))
+            }
+          })()
+        })
       },
     }),
   )
