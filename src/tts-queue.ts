@@ -52,7 +52,11 @@ export class TtsQueue {
   private readonly tts = new MsEdgeTTS()
   private readonly queues = new Map<string, SessionQueue>()
   private readonly listeners = new Set<FrameListener>()
-  private readonly voice: string
+  /**
+   * Voice name, re-read per synthesis batch: the host config field is a
+   * volatile cell, so a Settings write swaps the voice without remounting.
+   */
+  private readonly voice: () => string
   private readonly prosody?: ProsodyOptions
   private ready: Promise<void> | null = null
   /**
@@ -65,11 +69,12 @@ export class TtsQueue {
   private onDrained: (() => void) | null = null
 
   constructor(options: {
-    voice?: string
+    voice?: string | (() => string)
     prosody?: ProsodyOptions
     onDrained?: () => void
   } = {}) {
-    this.voice = options.voice ?? 'zh-CN-XiaoxiaoNeural'
+    const voice = options.voice ?? 'zh-CN-XiaoxiaoNeural'
+    this.voice = typeof voice === 'function' ? voice : () => voice
     this.prosody = options.prosody
     this.onDrained = options.onDrained ?? null
   }
@@ -78,7 +83,7 @@ export class TtsQueue {
   private async ensureReady(): Promise<void> {
     if (this.ready) return this.ready
     this.ready = this.tts
-      .setMetadata(this.voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3, {
+      .setMetadata(this.voice(), OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3, {
         wordBoundaryEnabled: false,
         sentenceBoundaryEnabled: false,
       })

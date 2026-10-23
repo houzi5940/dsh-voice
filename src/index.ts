@@ -129,6 +129,33 @@ export const Config: z<Config> = z.object({
     .default({}),
 })
 
+/**
+ * Resolve one schemastery volatile cell to its current value.
+ *
+ * Volatile fields arrive as live cells (a { get } object) so that
+ * `loader/volatile-update` writes apply without remounting the plugin;
+ * plain values pass through unchanged.
+ */
+function live<T>(cell: T): T {
+  const c = cell as unknown as { get?: () => T }
+  return typeof c?.get === 'function' ? c.get() : cell
+}
+
+/** Recursively resolve every volatile cell in a config section (for /config). */
+function resolveVolatile(node: unknown): unknown {
+  if (node === null || typeof node !== 'object') return node
+  const c = node as { get?: () => unknown }
+  if (typeof c.get === 'function' && Object.keys(c).length <= 2) {
+    return resolveVolatile(c.get())
+  }
+  if (Array.isArray(node)) return node.map(resolveVolatile)
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    out[key] = resolveVolatile(value)
+  }
+  return out
+}
+
 export function apply(ctx: Context, config: Config): void {
   const base = config.basePath.replace(/\/+$/, '') || BOOTSTRAP_BASE
 
@@ -141,7 +168,7 @@ export function apply(ctx: Context, config: Config): void {
   // latency cost is one handshake at the start of each spoken turn.
   let drained: Promise<void> | null = null
   const queue = new TtsQueue({
-    voice: config.voice,
+    voice: () => live(config.voice) ?? 'zh-CN-XiaoxiaoNeural',
     onDrained: () => {
       drained = queue.close().catch(() => {})
     },
@@ -160,11 +187,12 @@ export function apply(ctx: Context, config: Config): void {
   // --- llm/stream lossless tap: segment and enqueue, never block the model. ---
   const sessionSegmenters = new Map<string, SentenceSegmenter>()
   // Older configs may predate tts.mode; default to speaking everything.
-  const ttsMode = config.tts?.mode ?? 'all'
+  // tts.mode is volatile: resolve per turn so a settings write applies live.
+  const ttsMode = (): 'first' | 'all' | 'off' => live(config.tts?.mode) ?? 'all'
   ctx.on('llm/stream', (options: GenerateOptions, next): AsyncIterable<StreamChunk> => {
     const sessionId = options.sessionId
-    if (!config.enabled || sessionId === undefined) return next()
-    return tapStream(sessionId, next(), queue, sessionSegmenters, ttsMode)
+    if (!live(config.enabled) || sessionId === undefined) return next()
+    return tapStream(sessionId, next(), queue, sessionSegmenters, ttsMode())
   })
 
   // --- HTTP surface: SSE stream, cancel, and the wiring ping. ---
@@ -227,7 +255,7 @@ export function apply(ctx: Context, config: Config): void {
     res.statusCode = 200
     res.setHeader('content-type', 'application/json')
     // Always report the normalized base so the client can build its URLs.
-    res.end(JSON.stringify({ asr: config.asr, basePath: base }))
+    res.end(JSON.stringify({ asr: resolveVolatile(config.asr), basePath: base }))
   }
   // Serve /config on the configured base AND on the fixed bootstrap path,
   // so a client that does not know a custom basePath can still discover it.
@@ -389,7 +417,7 @@ export function apply(ctx: Context, config: Config): void {
       handler: (_req, res) => {
         res.statusCode = 200
         res.setHeader('content-type', 'application/json')
-        res.end(JSON.stringify({ ok: true, name: 'dsh-voice', enabled: config.enabled }))
+        res.end(JSON.stringify({ ok: true, name: 'dsh-voice', enabled: live(config.enabled) }))
       },
     }),
   )
