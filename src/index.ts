@@ -89,10 +89,20 @@ export interface Config {
   tts: TtsRuntimeConfig
 }
 
+/**
+ * Which fields the plugin-manager settings form may edit live. `volatile()`
+ * marks a field editable without remounting the plugin: the Settings service
+ * projects exactly these into its `ns = entry.id` form, and writes flow
+ * through the profile patch + HMR (configEditor) rather than a restart.
+ * Fields not listed here (basePath, cacheDir, asr.model, asr.modelHost,
+ * asr.language, asr.useItn) still compose from the patch but are considered
+ * bootstrap-level: changing them takes a reload anyway, so the form omits
+ * them to avoid writes that appear to do nothing.
+ */
 export const Config: z<Config> = z.object({
   basePath: z.string().default('/dsh-voice-api'),
-  voice: z.string().default('zh-CN-XiaoxiaoNeural'),
-  enabled: z.boolean().default(true),
+  voice: z.string().default('zh-CN-XiaoxiaoNeural').volatile(),
+  enabled: z.boolean().default(true).volatile(),
   cacheDir: z.string().default(join(os.homedir(), '.cache', 'dsh-voice', 'models')),
   asr: z
     .object({
@@ -102,16 +112,19 @@ export const Config: z<Config> = z.object({
       modelHost: z.string().default('https://huggingface.co'),
       language: z.string().default('auto'),
       useItn: z.boolean().default(true),
-      autoSend: z.boolean().default(false),
+      autoSend: z.boolean().default(false).volatile(),
       mode: z.union([z.const('toggle'), z.const('hold')]).default('toggle'),
-      hotkey: z.string().default('Control'),
+      hotkey: z.string().default('Control').volatile(),
       /** Silence (ms) that ends a tap-mode segment; lower = snappier sends. */
-      silenceMs: z.number().min(200).max(10_000).default(2000),
+      silenceMs: z.number().min(200).max(10_000).default(2000).volatile(),
     })
     .default({}),
   tts: z
     .object({
-      mode: z.union([z.const('first'), z.const('all'), z.const('off')]).default('all'),
+      mode: z
+        .union([z.const('first'), z.const('all'), z.const('off')])
+        .default('all')
+        .volatile(),
     })
     .default({}),
 })

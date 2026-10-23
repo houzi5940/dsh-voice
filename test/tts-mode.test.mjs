@@ -104,13 +104,33 @@ async function collectFrames(ttsMode) {
 }
 
 // --- config schema: tts.mode and asr.silenceMs defaults/ranges ---
+// Volatile fields carry defaults in schema meta and only materialize when
+// the Loader composes a real config source; assertions read meta instead.
 {
-  const defaults = new Config({})
-  if (defaults.tts.mode !== 'all') throw new Error('tts.mode default wrong: ' + defaults.tts.mode)
-  if (defaults.asr.silenceMs !== 2000) throw new Error('silenceMs default wrong: ' + defaults.asr.silenceMs)
-  const tuned = new Config({ asr: { silenceMs: 1000 }, tts: { mode: 'first' } })
-  if (tuned.asr.silenceMs !== 1000) throw new Error('silenceMs not honored: ' + tuned.asr.silenceMs)
-  if (tuned.tts.mode !== 'first') throw new Error('tts.mode not honored: ' + tuned.tts.mode)
+  const hotkeyMeta = Config.dict.asr.dict.hotkey.meta
+  if (hotkeyMeta.default !== 'Control' || hotkeyMeta.volatile !== true) {
+    throw new Error('asr.hotkey volatile default wrong: ' + JSON.stringify(hotkeyMeta))
+  }
+  const silenceMeta = Config.dict.asr.dict.silenceMs.meta
+  if (silenceMeta.default !== 2000 || silenceMeta.volatile !== true) {
+    throw new Error('asr.silenceMs volatile default wrong: ' + JSON.stringify(silenceMeta))
+  }
+  const modeMeta = Config.dict.tts.dict.mode.meta
+  if (modeMeta.default !== 'all' || modeMeta.volatile !== true) {
+    throw new Error('tts.mode volatile default wrong: ' + JSON.stringify(modeMeta))
+  }
+  const voiceMeta = Config.dict.voice.meta
+  if (voiceMeta.default !== 'zh-CN-XiaoxiaoNeural' || voiceMeta.volatile !== true) {
+    throw new Error('voice volatile default wrong: ' + JSON.stringify(voiceMeta))
+  }
+  const enabledMeta = Config.dict.enabled.meta
+  if (enabledMeta.default !== true || enabledMeta.volatile !== true) {
+    throw new Error('enabled volatile default wrong: ' + JSON.stringify(enabledMeta))
+  }
+  // Non-volatile fields still resolve eagerly.
+  const eager = new Config({})
+  if (eager.basePath !== '/dsh-voice-api') throw new Error('basePath default wrong: ' + eager.basePath)
+  // Range floor still enforced at construction time (volatile or not).
   let threw = false
   try {
     new Config({ asr: { silenceMs: 50 } })
@@ -118,7 +138,10 @@ async function collectFrames(ttsMode) {
     threw = true
   }
   if (!threw) throw new Error('silenceMs=50 should have failed the 200ms floor')
-  console.log('  ok  config: tts.mode + asr.silenceMs defaults, tuning, and floor')
+  // Volatile cells are resolved by the Loader at composition time, not by
+  // new Config(...); the live /config probe in host.integration covers the
+  // end-to-end resolution (autoSend/silenceMs/hotkey all materialize).
+  console.log('  ok  config: volatile defaults in schema meta, floor enforced')
 }
 
 console.log('\nALL TTS-MODE TESTS PASSED')

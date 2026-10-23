@@ -95,9 +95,40 @@ export function __resetVoiceConfigCache(): void {
 
 export const inject = ['slots', 'sessions']
 
+/**
+ * The Host keys `plugins.bundle.config` by the BUNDLE's package name — the
+ * name our own package.json declares, which is what `dsh plugin add`
+ * installed. The settings namespace, in contrast, is the loader ENTRY id
+ * ('voice'), because the Settings service keys forms by entry.options.id.
+ */
+const PKG_NAME = '@haoku123/dsh-voice'
+const SETTINGS_NS = 'voice'
+
 export function apply(ctx: any): void {
   // --- audio playback engine lives in the apply closure (object layer) ---
   const engine = createAudioEngine()
+
+  // --- bundle configuration page (Plugins → dsh-voice → details) ---
+  // Edits the Host's volatile Config fields through the shared settings
+  // form; writes persist to the profile patch and apply via HMR, so the
+  // voice engine and the client config endpoint pick them up live.
+  // Optional: a host without the settings client shows no config page.
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['configForms'], (formsCtx: any) => {
+      formsCtx.slots.inject('plugins.bundle.config', () =>
+        formsCtx.slots.register(
+          {
+            name: 'plugins.bundle.config',
+            key: PKG_NAME,
+          },
+          (ownerProps: { view?: 'summary' | 'page'; form?: any }) =>
+            ownerProps.view === 'summary' ? null : (
+              <VoiceConfigPage formService={formsCtx.configForms} />
+            ),
+        ),
+      )
+    })
+  }
 
   ctx.slots.inject('shell.overlay', () =>
     ctx.slots.register(
@@ -1274,4 +1305,259 @@ export function MicButton({ useSession, useInput, inputActions, skipPlayback, ca
       </button>
     </>
   )
+}
+
+// ---------------------------------------------------------------------------
+// Bundle configuration page (Plugins → dsh-voice → details).
+//
+// The Host Settings service exposes every `.volatile()` Config field under
+// ns = entry id ('voice'); this form reads/writes through the shared
+// `configForms` service, so saves persist to the profile patch and apply
+// through HMR — no restart, and both the voice engine and /config endpoint
+// see the new values immediately.
+// ---------------------------------------------------------------------------
+
+/** Snapshot shape of the settings form (ConfigFormController.getSnapshot()). */
+interface FormSnapshot {
+  status: 'loading' | 'ready' | 'unavailable'
+  value?: Record<string, unknown>
+  base?: Record<string, unknown>
+  user?: Record<string, unknown>
+  revision?: number
+  writable: boolean
+}
+
+const TTS_MODES: Array<{ value: string; label: string; hint: string }> = [
+  { value: 'first', label: '只播首句', hint: '每轮回答只朗读第一句，其余仅在会话中显示（推荐语音对话）' },
+  { value: 'all', label: '整篇朗读', hint: '逐句朗读完整回答（原版行为）' },
+  { value: 'off', label: '静音', hint: '只输入不朗读；麦克风与停顿发送不受影响' },
+]
+
+const VOICE_OPTIONS = [
+  'zh-CN-XiaoxiaoNeural',
+  'zh-CN-YunxiNeural',
+  'zh-CN-YunjianNeural',
+  'zh-CN-XiaoyiNeural',
+  'zh-TW-HsiaoChenNeural',
+  'en-US-AriaNeural',
+  'en-US-GuyNeural',
+  'ja-JP-NanamiNeural',
+]
+
+function asNested(value: unknown, key: string, fallback: Record<string, unknown>): Record<string, unknown> {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const inner = (value as Record<string, unknown>)[key]
+    if (inner !== null && typeof inner === 'object' && !Array.isArray(inner)) {
+      return inner as Record<string, unknown>
+    }
+  }
+  return fallback
+}
+
+function VoiceConfigPage({ formService }: { formService: any }): React.ReactElement {
+  useConfigStyle()
+  // ns = the loader entry id; the Settings service keys forms that way.
+  const form = formService.get(SETTINGS_NS)
+  const [snap, setSnap] = useState<FormSnapshot>(form.getSnapshot())
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    const update = (): void => setSnap(form.getSnapshot())
+    update()
+    return form.subscribe(update)
+  }, [form])
+
+  // Local mirrors so number inputs feel instant while writes settle.
+  const asr = asNested(snap.value, 'asr', {})
+  const tts = asNested(snap.value, 'tts', {})
+  const voice = typeof snap.value?.['voice'] === 'string' ? (snap.value['voice'] as string) : 'zh-CN-XiaoxiaoNeural'
+  const autoSend = asr['autoSend'] === true
+  const hotkey = typeof asr['hotkey'] === 'string' ? (asr['hotkey'] as string) : 'Control'
+  const silenceMs = typeof asr['silenceMs'] === 'number' ? (asr['silenceMs'] as number) : 2000
+  const ttsMode = typeof tts['mode'] === 'string' ? (tts['mode'] as string) : 'all'
+  const [silenceText, setSilenceText] = useState<string | null>(null)
+  const shownSilence = silenceText ?? String(silenceMs)
+
+  const write = async (ops: Array<{ op: string; path: string[]; value?: unknown }>): Promise<void> => {
+    if (busy || !snap.writable) return
+    setBusy(true)
+    setError(null)
+    try {
+      const ok = await form.mutate(ops)
+      if (!ok) setError('保存被拒绝：配置可能刚被其他地方修改，已重新加载最新值')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (snap.status !== 'ready') {
+    return (
+      <section className="dshv-cfg">
+        <p className="dshv-cfg-hint">
+          {snap.status === 'loading' ? '正在读取语音配置…' : '语音配置暂不可用（插件未激活或部署只读）'}
+        </p>
+      </section>
+    )
+  }
+
+  return (
+    <section className="dshv-cfg" aria-busy={busy}>
+      <h3 className="dshv-cfg-title">语音对话</h3>
+      <p className="dshv-cfg-hint">
+        修改立即生效：保存会写入当前 profile 的插件配置并热更新，无需重启。点按麦克风开启连续听写；说话{' '}
+        {shownSilence}ms 静音即自动发送；朗读时开口即可打断。
+      </p>
+
+      <label className="dshv-cfg-row">
+        <span className="dshv-cfg-name">停顿即发送</span>
+        <span className="dshv-cfg-control">
+          <input
+            type="checkbox"
+            checked={autoSend}
+            disabled={busy || !snap.writable}
+            onChange={(e) => write([{ op: 'set', path: ['asr', 'autoSend'], value: e.target.checked }])}
+          />
+          <span className="dshv-cfg-sub">停顿断句后自动提交，不用手动点发送</span>
+        </span>
+      </label>
+
+      <label className="dshv-cfg-row">
+        <span className="dshv-cfg-name">静音断句</span>
+        <span className="dshv-cfg-control">
+          <input
+            type="range"
+            min={200}
+            max={4000}
+            step={100}
+            value={shownSilence}
+            disabled={busy || !snap.writable}
+            onChange={(e) => setSilenceText(e.target.value)}
+            onInput={(e) => setSilenceText((e.target as HTMLInputElement).value)}
+            onBlur={() => {
+              const n = Number(shownSilence)
+              setSilenceText(null)
+              if (Number.isFinite(n) && n !== silenceMs) {
+                void write([{ op: 'set', path: ['asr', 'silenceMs'], value: Math.max(200, Math.min(10000, n)) }])
+              }
+            }}
+          />
+          <span className="dshv-cfg-sub">{shownSilence} ms（越小发送越快，越大越能容忍思考停顿）</span>
+        </span>
+      </label>
+
+      <div className="dshv-cfg-row">
+        <span className="dshv-cfg-name">朗读策略</span>
+        <div className="dshv-cfg-control dshv-cfg-stack">
+          {TTS_MODES.map((m) => (
+            <label key={m.value} className="dshv-cfg-choice">
+              <input
+                type="radio"
+                name="dshv-tts-mode"
+                value={m.value}
+                checked={ttsMode === m.value}
+                disabled={busy || !snap.writable}
+                onChange={() => write([{ op: 'set', path: ['tts', 'mode'], value: m.value }])}
+              />
+              <span>
+                <strong>{m.label}</strong>
+                <em>{m.hint}</em>
+              </span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <label className="dshv-cfg-row">
+        <span className="dshv-cfg-name">朗读音色</span>
+        <span className="dshv-cfg-control">
+          <select
+            value={VOICE_OPTIONS.includes(voice) ? voice : ''}
+            disabled={busy || !snap.writable}
+            onChange={(e) => write([{ op: 'set', path: ['voice'], value: e.target.value }])}
+          >
+            {!VOICE_OPTIONS.includes(voice) && <option value="">{voice}（自定义）</option>}
+            {VOICE_OPTIONS.map((v) => (
+              <option key={v} value={v}>
+                {v}
+              </option>
+            ))}
+          </select>
+          <span className="dshv-cfg-sub">微软 Edge TTS 在线合成</span>
+        </span>
+      </label>
+
+      <label className="dshv-cfg-row">
+        <span className="dshv-cfg-name">长按说话键</span>
+        <span className="dshv-cfg-control">
+          <select
+            value={['Control', 'Alt', 'Meta', 'Shift', 'Space', ''].includes(hotkey) ? hotkey : ''}
+            disabled={busy || !snap.writable}
+            onChange={(e) => write([{ op: 'set', path: ['asr', 'hotkey'], value: e.target.value }])}
+          >
+            {!['Control', 'Alt', 'Meta', 'Shift', 'Space', ''].includes(hotkey) && (
+              <option value="">{hotkey}（自定义）</option>
+            )}
+            <option value="Control">Control（默认）</option>
+            <option value="Alt">Alt</option>
+            <option value="Meta">⌘ / Win</option>
+            <option value="Shift">Shift</option>
+            <option value="Space">Space</option>
+            <option value="">关闭键盘长按</option>
+          </select>
+          <span className="dshv-cfg-sub">长按说话、松开发送；按住期间按其他键会取消录音</span>
+        </span>
+      </label>
+
+      {error && (
+        <p className="dshv-cfg-error" role="alert">
+          {error}
+        </p>
+      )}
+      {!snap.writable && (
+        <p className="dshv-cfg-error" role="status">
+          当前部署只读，无法保存修改。
+        </p>
+      )}
+    </section>
+  )
+}
+
+const CONFIG_CSS = `
+.dshv-cfg { display:flex; flex-direction:column; gap:18px; font-family:var(--ds-font-family,-apple-system,system-ui,sans-serif); }
+.dshv-cfg-title { margin:0; font-size:15px; font-weight:600; color:var(--dsw-alias-label-primary,inherit); }
+.dshv-cfg-hint { margin:0; font-size:12.5px; line-height:1.6; color:var(--dsw-alias-label-tertiary,inherit); }
+.dshv-cfg-row { display:flex; gap:14px; align-items:flex-start; margin:0; }
+.dshv-cfg-name { flex:none; width:92px; padding-top:6px; font-size:13px; font-weight:500; color:var(--dsw-alias-label-secondary,inherit); }
+.dshv-cfg-control { flex:1; display:flex; flex-direction:column; gap:4px; min-width:0; }
+.dshv-cfg-control input[type=checkbox] { width:16px; height:16px; accent-color:var(--dsw-alias-state-business-primary,#4f46e5); }
+.dshv-cfg-control input[type=range] { width:100%; max-width:320px; accent-color:var(--dsw-alias-state-business-primary,#4f46e5); }
+.dshv-cfg-control select {
+  max-width:280px; height:32px; padding:0 10px; font:inherit; font-size:13px;
+  color:var(--dsw-alias-label-primary,inherit); background:var(--dsw-alias-bg-layer-2,transparent);
+  border:.5px solid var(--dsw-alias-border-l4,rgba(128,128,128,.4)); border-radius:8px; outline:none;
+}
+.dshv-cfg-control select:focus-visible { border-color:var(--dsw-alias-state-business-primary,#4f46e5); }
+.dshv-cfg-sub { font-size:12px; line-height:1.5; color:var(--dsw-alias-label-tertiary,inherit); }
+.dshv-cfg-stack { gap:8px; }
+.dshv-cfg-choice { display:flex; gap:10px; align-items:flex-start; cursor:pointer; }
+.dshv-cfg-choice input[type=radio] { margin-top:3px; width:15px; height:15px; accent-color:var(--dsw-alias-state-business-primary,#4f46e5); }
+.dshv-cfg-choice span { display:flex; flex-direction:column; gap:2px; }
+.dshv-cfg-choice strong { font-size:13px; font-weight:600; color:var(--dsw-alias-label-primary,inherit); }
+.dshv-cfg-choice em { font-style:normal; font-size:12px; color:var(--dsw-alias-label-tertiary,inherit); }
+.dshv-cfg-error { margin:0; font-size:12.5px; color:var(--dsw-alias-state-error-primary,#f85149); }
+`
+
+// The page registers its own style block on first render.
+let configStyleInjected = false
+function useConfigStyle(): void {
+  useEffect(() => {
+    if (configStyleInjected) return
+    configStyleInjected = true
+    const el = document.createElement('style')
+    el.textContent = CONFIG_CSS
+    document.head.appendChild(el)
+  }, [])
 }

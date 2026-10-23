@@ -142,13 +142,16 @@ console.log('  ok  routes registered')
 }
 
 // Config schema defaults: hotkey must default to Control (the client treats
-// an empty string as "keyboard route off").
+// an empty string as "keyboard route off"). Volatile fields carry their
+// defaults in schema.meta.default — they only materialize when the Loader
+// composes a real config source, so read the schema, not new Config({}).
 {
-  const defaults = new Config({}).asr
-  if (defaults.hotkey !== 'Control') {
-    throw new Error('asr.hotkey default wrong: ' + JSON.stringify(defaults))
+  const asr = Config.dict?.asr?.dict ?? {}
+  const hotkeyDefault = asr.hotkey?.meta?.default
+  if (hotkeyDefault !== 'Control') {
+    throw new Error('asr.hotkey default wrong: ' + JSON.stringify(hotkeyDefault))
   }
-  console.log('  ok  asr.hotkey defaults to', defaults.hotkey)
+  console.log('  ok  asr.hotkey defaults to', hotkeyDefault)
 }
 
 // capture llm/stream listener
