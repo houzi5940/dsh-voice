@@ -52,6 +52,10 @@ const ENERGY_THRESHOLD = 0.015
 /** RMS that maps to a full-height waveform bar (speech peaks ~0.2-0.3). */
 const LEVEL_CEILING = 0.25
 const SILENCE_TIMEOUT_MS = 2000
+/** Poll interval while the host downloads the ASR model. */
+const MODEL_WAIT_MS = 1500
+/** ~6 minutes of patience for a first-run model download. */
+const MAX_MODEL_WAITS = 240
 const MAX_SEGMENT_MS = 30000
 const PRE_PAD_MS = 250
 const POST_PAD_MS = 350
@@ -256,10 +260,17 @@ export function createAsrEngine(
     }
   }
 
-  /** Drain queued final segments, one host request at a time. */
+  /**
+   * Drain queued final segments, one host request at a time.
+   *
+   * A 503 means the host is still downloading the model: the audio is put
+   * back at the head of the queue and retried, so the user's first utterance
+   * is not lost while a few hundred MB land on disk.
+   */
   const drainSegments = async (): Promise<void> => {
     if (draining) return
     draining = true
+    let modelWaits = 0
     try {
       while (pendingSegments.length > 0) {
         const audio = pendingSegments.shift()!
@@ -276,7 +287,18 @@ export function createAsrEngine(
             headers: { 'content-type': 'application/octet-stream' },
             body,
           })
+          if (res.status === 503) {
+            modelWaits += 1
+            if (modelWaits > MAX_MODEL_WAITS) {
+              throw new Error('语音模型仍在准备中，请稍后再试')
+            }
+            setState('loading-model')
+            pendingSegments.unshift(audio)
+            await new Promise((resolve) => setTimeout(resolve, MODEL_WAIT_MS))
+            continue
+          }
           if (!res.ok) throw new Error(`asr http ${res.status}`)
+          modelWaits = 0
           const out = (await res.json()) as { text?: string }
           // A cancelled capture must not write its transcript into the draft.
           if (epoch === finalEpoch && out.text) emitTranscript(out.text)

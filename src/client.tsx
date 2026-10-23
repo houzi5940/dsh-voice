@@ -812,6 +812,22 @@ async function runMicDiagnostics(): Promise<MicCheck[]> {
     add('Host 语音服务', false, errorDetail(e))
   }
 
+  try {
+    const res = await fetch(apiUrl('/status'), { cache: 'no-store' })
+    const data = (await res.json()) as {
+      model?: { state?: string; received?: number; total?: number; error?: string }
+    }
+    const m = data.model ?? {}
+    const mb = (n?: number): string => `${Math.round((n ?? 0) / 1024 / 1024)}MB`
+    if (m.state === 'ready') add('语音模型', true, `已就绪（${mb(m.total)}）`)
+    else if (m.state === 'downloading')
+      add('语音模型', false, `下载中：${mb(m.received)} / ${m.total ? mb(m.total) : '未知'}（首次使用需下载，完成后自动可用）`)
+    else if (m.state === 'error') add('语音模型', false, `下载失败：${m.error ?? '未知错误'}`)
+    else add('语音模型', false, '未下载：首次说话时自动下载并重试，也可点「准备语音模型」立即开始')
+  } catch (e) {
+    add('语音模型', false, errorDetail(e))
+  }
+
   return checks
 }
 
@@ -1643,21 +1659,42 @@ function VoiceConfigPage({
       <div className="dshv-cfg-row">
         <span className="dshv-cfg-name">麦克风自检</span>
         <div className="dshv-cfg-control">
-          <button
-            type="button"
-            className="dshv-cfg-check"
-            disabled={checking}
-            onClick={() => {
-              setChecking(true)
-              setChecks(null)
-              void runMicDiagnostics()
-                .then(setChecks)
-                .catch((e: unknown) => setChecks([{ label: '自检失败', ok: false, detail: errorDetail(e) }]))
-                .finally(() => setChecking(false))
-            }}
-          >
-            {checking ? '检测中…' : '运行自检'}
-          </button>
+          <div className="dshv-cfg-checkrow">
+            <button
+              type="button"
+              className="dshv-cfg-check"
+              disabled={checking}
+              onClick={() => {
+                setChecking(true)
+                setChecks(null)
+                void runMicDiagnostics()
+                  .then(setChecks)
+                  .catch((e: unknown) => setChecks([{ label: '自检失败', ok: false, detail: errorDetail(e) }]))
+                  .finally(() => setChecking(false))
+              }}
+            >
+              {checking ? '检测中…' : '运行自检'}
+            </button>
+            <button
+              type="button"
+              className="dshv-cfg-check"
+              disabled={checking}
+              title="下载 SenseVoice 模型（约 240MB），首次使用必须完成"
+              onClick={() => {
+                setChecking(true)
+                setChecks(null)
+                void fetch(apiUrl('/model'), { method: 'POST' })
+                  .catch(() => {})
+                  .then(() => new Promise((r) => setTimeout(r, 1200)))
+                  .then(() => runMicDiagnostics())
+                  .then(setChecks)
+                  .catch((e: unknown) => setChecks([{ label: '自检失败', ok: false, detail: errorDetail(e) }]))
+                  .finally(() => setChecking(false))
+              }}
+            >
+              准备语音模型
+            </button>
+          </div>
           {checks !== null && (
             <ul className="dshv-cfg-checks">
               {checks.map((c) => (
@@ -1735,6 +1772,7 @@ const CONFIG_CSS = `
 .dshv-cfg-choice strong { font-size:13px; font-weight:600; color:var(--dsw-alias-label-primary,inherit); }
 .dshv-cfg-choice em { font-style:normal; font-size:12px; color:var(--dsw-alias-label-tertiary,inherit); }
 .dshv-cfg-error { margin:0; font-size:12.5px; color:var(--dsw-alias-state-error-primary,#f85149); }
+.dshv-cfg-checkrow { display:flex; gap:8px; flex-wrap:wrap; }
 .dshv-cfg-check {
   align-self:flex-start; height:28px; padding:0 12px; font:inherit; font-size:12.5px; cursor:pointer;
   color:var(--dsw-alias-label-primary,inherit); background:var(--dsw-alias-bg-layer-3,transparent);

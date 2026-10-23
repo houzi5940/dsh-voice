@@ -279,19 +279,138 @@ export function apply(ctx: Context, config: Config): void {
   // --- SenseVoice ASR (host-side, via sherpa-onnx). ---
   // The browser records + segments audio and POSTs raw little-endian f32
   // PCM (16 kHz); we run SenseVoice locally. Model files live in cacheDir
-  // (filled by the /hf cache-through proxy on first use, or prefetch).
+  // and are downloaded on demand: sherpa-onnx does NOT throw when the files
+  // are absent — it logs "Errors in config" and decodes silence to "", which
+  // surfaces as "the mic works but nothing is ever sent". So readiness is
+  // checked here, never inferred from the recognizer constructor.
+  // Old or hand-written configs may omit these; fall back to the schema
+  // defaults instead of crashing apply() on a `join(undefined)`.
+  const cacheDir =
+    config.cacheDir || join(os.homedir(), '.cache', 'dsh-voice', 'models')
+  const modelId =
+    config.asr?.model || 'csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17'
+  const modelHost = config.asr?.modelHost || 'https://huggingface.co'
+  const modelRoot = join(cacheDir, modelId, 'resolve', 'main')
+  const modelPath = join(modelRoot, 'model.int8.onnx')
+  const tokensPath = join(modelRoot, 'tokens.txt')
+  type ModelPhase = {
+    state: 'missing' | 'downloading' | 'ready' | 'error'
+    received: number
+    total: number
+    error?: string
+  }
+  let modelPhase: ModelPhase = { state: 'missing', received: 0, total: 0 }
+  let modelTask: Promise<void> | null = null
+
+  const fileSize = async (path: string): Promise<number> => {
+    try {
+      return (await stat(path)).size
+    } catch {
+      return 0
+    }
+  }
+
+  /** Stream one model file into place, resuming a `.part` left by a crash. */
+  const downloadModelFile = async (
+    name: string,
+    dest: string,
+    onBytes: (delta: number) => void,
+  ): Promise<void> => {
+    const base = modelHost.replace(/\/+$/, '')
+    const url = `${base}/${modelId}/resolve/main/${name}`
+    const part = `${dest}.part`
+    const have = await fileSize(part)
+    const headers: Record<string, string> = have > 0 ? { range: `bytes=${have}-` } : {}
+    const res = await fetch(url, { headers, redirect: 'follow' })
+    if (res.status !== 200 && res.status !== 206) {
+      throw new Error(`下载 ${name} 失败：HTTP ${res.status}`)
+    }
+    const append = res.status === 206 && have > 0
+    const remaining = Number(res.headers.get('content-length') ?? '0')
+    if (append) modelPhase.total = Math.max(modelPhase.total, have + remaining)
+    else if (name.endsWith('.onnx')) modelPhase.total = remaining
+    const sink = createWriteStream(part, { flags: append ? 'a' : 'w' })
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error(`下载 ${name} 失败：响应无正文`)
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) {
+          if (!sink.write(Buffer.from(value))) {
+            await new Promise<void>((resolve) => sink.once('drain', resolve))
+          }
+          modelPhase.received += value.byteLength
+          onBytes(value.byteLength)
+        }
+      }
+    } finally {
+      sink.end()
+      await new Promise<void>((resolve) => sink.once('close', resolve))
+    }
+    const got = await fileSize(part)
+    if (name.endsWith('.onnx') && got < 10_000_000) {
+      throw new Error(`模型文件不完整（${got} 字节）`)
+    }
+    if (name === 'tokens.txt' && got < 10_000) {
+      throw new Error(`词表文件不完整（${got} 字节）`)
+    }
+    await rename(part, dest)
+  }
+
+  /**
+   * Make the model files available, downloading once. Concurrent callers
+   * share one task; a failed attempt clears it so a later call can retry.
+   */
+  const ensureModel = async (): Promise<void> => {
+    if (modelPhase.state === 'ready') return
+    if (modelTask) return modelTask
+    modelTask = (async () => {
+      const modelBytes = await fileSize(modelPath)
+      const tokenBytes = await fileSize(tokensPath)
+      if (modelBytes > 10_000_000 && tokenBytes > 10_000) {
+        modelPhase = { state: 'ready', received: modelBytes, total: modelBytes }
+        return
+      }
+      modelPhase = { state: 'downloading', received: 0, total: 0 }
+      await mkdir(modelRoot, { recursive: true })
+      await downloadModelFile('model.int8.onnx', modelPath, () => {})
+      await downloadModelFile('tokens.txt', tokensPath, () => {})
+      const total = await fileSize(modelPath)
+      modelPhase = { state: 'ready', received: total, total }
+    })()
+      .catch((error) => {
+        modelPhase = {
+          state: 'error',
+          received: modelPhase.received,
+          total: modelPhase.total,
+          error: error instanceof Error ? error.message : String(error),
+        }
+        throw error
+      })
+      .finally(() => {
+        modelTask = null
+      })
+    return modelTask
+  }
+
+  // Warm the cache in the background once the plugin mounts; a missing model
+  // is the difference between "voice works" and "nothing ever gets sent".
+  void ensureModel().catch((error) => {
+    console.warn(`[dsh-voice] model download failed: ${String(error)}`)
+  })
+
   let recognizer: SherpaRecognizer | null = null
   const getRecognizer = (): SherpaRecognizer => {
     if (recognizer) return recognizer
-    const repo = join(config.cacheDir, config.asr.model, 'resolve', 'main')
     recognizer = createOfflineRecognizer({
       modelConfig: {
         senseVoice: {
-          model: join(repo, 'model.int8.onnx'),
+          model: modelPath,
           language: config.asr.language,
           useInverseTextNormalization: config.asr.useItn ? 1 : 0,
         },
-        tokens: join(repo, 'tokens.txt'),
+        tokens: tokensPath,
         numThreads: 4,
         debug: 0,
         provider: 'cpu',
@@ -346,9 +465,18 @@ export function apply(ctx: Context, config: Config): void {
         req.on('end', () => {
           const buf = Buffer.concat(chunks)
           res.setHeader('content-type', 'application/json')
+          // Malformed payloads are a client bug regardless of model state.
           if (buf.length % 4 !== 0 || buf.length === 0) {
             res.statusCode = 400
             res.end(JSON.stringify({ error: 'invalid pcm payload' }))
+            return
+          }
+          // sherpa-onnx silently decodes with missing weights, so a missing
+          // model must be refused here — the client retries the same audio.
+          if (modelPhase.state !== 'ready') {
+            void ensureModel().catch(() => {})
+            res.statusCode = 503
+            res.end(JSON.stringify({ error: 'model-not-ready', model: modelPhase }))
             return
           }
           const delta = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4)
@@ -381,6 +509,38 @@ export function apply(ctx: Context, config: Config): void {
             res.end(JSON.stringify({ error: String(error) }))
           }
         })
+      },
+    }),
+  )
+
+  // Model readiness for the settings self-check and the manual download
+  // button; the client polls this while a download is in flight.
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${base}/status`,
+      handler: (_req, res: ServerResponse) => {
+        res.statusCode = 200
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({ model: modelPhase, path: modelRoot }))
+      },
+    }),
+  )
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${base}/model`,
+      handler: (req, res: ServerResponse) => {
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end('POST only')
+          return
+        }
+        req.resume()
+        void ensureModel().catch(() => {})
+        res.statusCode = 202
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({ model: modelPhase }))
       },
     }),
   )
