@@ -70,7 +70,10 @@ docs/demo.py        # Pillow 手绘 demo.gif（无需真人录制）
 - **ScriptProcessor buffer 必须是 2 的幂**：`asr.ts` 里 `BUFFER_SIZE = 1024`。曾用 `BUFFER_MS * (SAMPLE_RATE/1000)` = 1600 → 运行时抛错。
 - **whisper-small 没有 q8 encoder**（若将来回退 transformers.js 需注意）；transformers.js 4.2.0 有 q8 decoder optimizer bug（huggingface/transformers.js#1707）。
 - **exports 缺 `./package.json`** → 插件静默不加载（连报错都没有）。排查：`curl` 首页看 `__DSH_BOOT__` 的 entries 里有没有该插件。
-- **本地开发时 profile 的 `file:` 依赖是拷贝不是软链**：改完 build 后必须 `pnpm remove` + `pnpm add file:...` 重装，并 `md5` 对比两份 `lib/client.js` 一致，再重启 dsh。
+- **本地开发时 profile 的 `file:` 依赖可能是硬链接，不是拷贝也不是软链**：当前 pnpm 下 `ls -li` 会看到 profile 里的 `package.json`/`lib/*.js` 与工作区 inode 相同、link count 为 2，build 后自动生效；若 esbuild 改成 rename 写入就会断链，用 `ls -li` + `md5` 对比，必要时 `pnpm remove` + `pnpm add file:...` 重装。
+- **dsh ≥ 0.2 的解析器会崩在 `require('buffer/')`**：`msedge-tts` 的浏览器 polyfill 依赖用了 `require('buffer/')` / `require('string_decoder/')`，dsh 的 `ResolutionRouter` 会把它当内置模块，`resolve.paths` 返回 null 后直接抛 `createRequire.resolve.paths is not a function or its return value is not iterable`。因此 `msedge-tts` **必须打进 host bundle**（`build.mjs` 里不能 external），让 esbuild 在构建期解析掉这些 require。
+- **host bundle 需要 `createRequire` banner**：打包进来的 axios 会动态 `require('util')`，ESM 输出没有 require，会报 `Dynamic require of "util" is not supported`；`build.mjs` 的 banner 用 `createRequire(import.meta.url)` 补上。
+- **peerDependencies 必须覆盖 dsh 0.2**：`@deepseek-ai/dsh-web` 的范围要包含 `^0.2.1-rc.2`，否则 dsh 启动时会直接跳过插件并打印 `skipping profile bundle`（可用 `dsh plugin --profile web allow-version ...` 临时豁免，但发布前应改正）。
 - **错误态要在标签上露出**：`MicButton` 的 label 判断中 `error` 必须优先于 `asrState === 'idle'`，否则 host config 拉取失败时用户只看到普通的 `mic`（曾是真 bug，被组件测试抓出）。
 - **window 级监听不能捕获渲染闭包**：`MicButton` 的指针/键盘监听只在挂载时装一次，所有回调必须走 `beginHoldRef`/`endHoldRef`/`findSendKeyRef` 转发，否则拿到的是首帧的陈旧闭包（曾导致"按了没反应"）。
 - **VAD 门控曾静默吞掉长按录音**：RMS < 0.015 的整段录音在 tap 模式下会被丢弃，长按时表现为"按了说话没用"。修法是 hold 模式全程收音；另外时长判断要在**补尾垫之前**测，否则 350ms 静音垫会让 64ms 的误触通过下限。

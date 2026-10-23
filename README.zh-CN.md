@@ -23,6 +23,7 @@ DeepSeek Harness（dsh）的**全双工语音插件**：说话 → 语音识别 
 ## 环境要求
 
 - Node.js ≥ 22.19 或 ≥ 24（依赖 `node:zlib` 的 zstd API）
+- dsh `0.1.0-rc.6` 或 `0.2.x`（插件的 `@deepseek-ai/dsh-web` peer 范围已覆盖两者）
 - 一个可用的 dsh `web` profile
 - 浏览器麦克风权限
 

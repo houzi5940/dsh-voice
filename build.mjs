@@ -23,6 +23,12 @@ const PLATFORM_EXTERNALS = [
 mkdirSync('lib', { recursive: true })
 
 // --- host half: plain ESM cordis plugin; runtime deps stay external ---
+//
+// msedge-tts is BUNDLED on purpose: dsh >= 0.2 routes CJS requires through its
+// own resolver, which crashes on the browser-polyfill specifiers the package
+// uses (`require('buffer/')`, `require('string_decoder/')`): the router sees
+// the bare name "buffer", gets a null search-path list from Node (it is a
+// builtin), and throws. Bundling resolves those at build time.
 await build({
   entryPoints: ['src/index.ts'],
   outfile: 'lib/index.js',
@@ -34,10 +40,20 @@ await build({
     '@deepseek-ai/schemastery',
     '@deepseek-ai/dsh-host-webserver',
     '@deepseek-ai/dsh-llm',
-    'msedge-tts',
     'sherpa-onnx',
+    // Optional native accelerators of ws; absence is handled by try/catch.
+    'bufferutil',
+    'utf-8-validate',
     'node:*',
   ],
+  // Bundled CJS dependencies (axios via msedge-tts) call `require('util')`
+  // dynamically. ESM has no require, so expose one built from this module's
+  // URL; esbuild's __require helper picks it up.
+  banner: {
+    js:
+      "import { createRequire as __dshCreateRequire } from 'node:module';\n" +
+      'const require = __dshCreateRequire(import.meta.url);',
+  },
   logLevel: 'info',
 })
 

@@ -6,7 +6,7 @@ Full-duplex voice mode for DeepSeek Harness: streamed ASR → LLM → TTS with b
 
 ## Status
 
-**v0.8.1 — press-to-talk with a live caption.**
+**v0.8.2 — press-to-talk with a live caption.**
 
 Speak into the composer mic: the assistant silences itself (playback stops,
 host synthesis queue drops), the running turn is cancelled (the stop-button
@@ -139,7 +139,8 @@ dsh plugin --profile web add <repo-url-or-path>
 dsh --profile web
 ```
 
-Note: needs Node ≥ 22.19 or ≥ 24 (`node:zlib` zstd APIs).
+Note: needs Node ≥ 22.19 or ≥ 24 (`node:zlib` zstd APIs). Works with dsh
+0.1.0-rc.6 and 0.2.x — the `@deepseek-ai/dsh-web` peer range covers both.
 
 ## Tests
 
